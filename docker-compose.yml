@@ -1,0 +1,18 @@
+version: "3.8"
+
+name: cloops-nats
+
+services:
+  nats:
+    image: nats:latest
+    command: "-c /etc/nats/nats.conf"
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+      - "8080:8080"
+    volumes:
+      - nats-data:/data
+      - ./nats.conf:/etc/nats/nats.conf:ro
+
+volumes:
+  nats-data:

@@ -1,0 +1,33 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+  </PropertyGroup>
+
+
+  <!-- Nuget Metadata -->
+  <PropertyGroup>
+    <PackageId>cloops.nats</PackageId>
+    <Authors>Gaurav Kalele, Atul Soam</Authors>
+    <Company>Connection Loops</Company>
+    <PackageDescription>Official SDK to effortlessly use NATS in Connection Loops.</PackageDescription>
+    <PackageTags>sdk;cloops;nats;events;pubsub</PackageTags>
+    <RepositoryUrl>https://dev.azure.com/clvc/MeAtConnectionLoops/_git/cloops.nats</RepositoryUrl>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://dev.azure.com/clvc/MeAtConnectionLoops/_git/cloops.nats</PackageProjectUrl>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="NATS.Net" Version="2.6.6" />
+    <PackageReference Include="NATS.Jwt" Version="1.0.0-preview.16" />
+  </ItemGroup>
+
+  <!-- static files -->
+   <ItemGroup>
+        <None Include="README.md" Pack="true" PackagePath="\" />
+    </ItemGroup>
+
+</Project>

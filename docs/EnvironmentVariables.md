@@ -1,0 +1,24 @@
+# Environment Variables used by SDK
+
+- `NATS_SUBSCRIPTION_QUEUE_SIZE`
+  - This vaiable defines what should be the max limit of messages queued up for each subscription. Use this to control backpressure. Default: 20,000
+  - If your processing is slow then messages pile up in the queue consuming memory. This gives you way to control memory growth.
+  - It is also puts backpressure once the queue is full so as to not overload your application.
+  - Do not increase this blindly. First consider if you can make your message processing faster by either optimizing logic or doing things async.
+- `NATS_CONSUMER_MAX_DOP`
+  - Defines maximum degree of parallelism for all consumers. These many messages can be processed in parallel from the message queue. Default: 128
+  - This puts upper limit on rps (request per second), not literally, but indirectly. e.g. if your avg latency to process a message is 200ms then max_dop \* 5 is your max throughput. Increase this in order to support higher rps. Consider giving higher core / memory count as well.
+- (Optional) Minting Service related environment variables
+  - Highly confidential. Only use in trusted services.
+  - Used by minting service when you need your application to mint new Nats Tokens.
+  - `NATS_ACCOUNT_SIGNING_SEED`
+    - Signing account seed
+    - How to get it
+      - On nats-box
+      - run `cd /data/nsc/nkeys/keys/A`
+      - run `find . -type f -name "*.nk" -o -name "*.seed"`
+      - run `cat <account-signing-public-key>.nk` to get the account signing seed. (remember to pick public key of singing account not main account)
+  - `NATS_ACCOUNT_PUBLIC_KEY`
+    - Main account public key
+    - How to get it
+      - Run this on nats-box to get the account public key: `nsc list keys --account=<account-name>` (remember to pick the main account not signing key)

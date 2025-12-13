@@ -1,0 +1,1 @@
+nats stream create CP_F_14d --subjects 'CP.>'
