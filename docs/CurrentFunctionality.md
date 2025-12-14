@@ -44,6 +44,7 @@ The SDK provides a framework for building reliable, type-safe NATS messaging app
 - **Type safety**: Strongly-typed message handling with compile-time validation
 - **Queue groups**: Built-in load balancing across multiple consumer instances
 - **Dual protocol support**: Seamless handling of both NATS Core and JetStream messages
+- **Automatic message validation**: If a message type has a `Validate()` method, the SDK automatically validates messages before processing. Invalid messages are discarded (JetStream messages are terminated, Core NATS messages are skipped).
 - **Explicit ACK/NAK contract**: **All handlers** must return `Task<NatsAck>`. JetStream uses the result to `Ack` on `Success` or `Nak` on `Fail`; Core ignores it.
 - **Handler signature enforcement**: The SDK validates at startup that handlers return `Task<NatsAck>`, preventing misconfiguration.
 - **Automatic ACK/NAK (JetStream)**: After handler execution, the processor calls `AckAsync` or `NakAsync` based on the handler’s result, guaranteeing at-least-once delivery.
