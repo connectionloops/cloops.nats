@@ -1,10 +1,6 @@
 using CLOOPS.NATS.Attributes;
 using NATS.Client.Core;
-using CLOOPS.NATS.Messages.CP.Infra;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using System.Net;
 using CLOOPS.NATS.Meta;
 
 namespace CLOOPS.NATS.Examples;
@@ -24,126 +20,59 @@ public class ConsumerExample
 
     /// <summary>
     /// echo back the message
+    /// This is responder i.e. it sends reply back
     /// </summary>
     /// <param name="msg"></param>
     /// <param name="ct"></param>
     /// <returns></returns>
-    [NatsConsumer("dev.echo", false)]
-    public async Task<NatsAck> EchoBack(NatsMsg<string> msg, CancellationToken ct = default)
+    [NatsConsumer("dev.echo")]
+    public Task<NatsAck> EchoBack(NatsMsg<string> msg, CancellationToken ct = default)
     {
         _logger.LogInformation("Received message: {Message}", msg.Data);
-        // Handle the message
-        return new NatsAck(true, msg.Data);
+        // Handle the message - return with reply data for request-reply pattern
+        return Task.FromResult(new NatsAck(true, msg.Data));
     }
 
     /// <summary>
-    /// Handles EffectTriggered events from CP instances
+    /// Handles save person events
     /// </summary>
-    /// <param name="msg">The NATS message containing the EffectTriggered payload</param>
+    /// <param name="msg">The NATS message containing the Person payload</param>
     /// <param name="ct">Cancellation token for the async operation</param>
-    [NatsConsumer("CP.*.EffectTriggered", false)]
-    public async Task<NatsAck> HandleEffectTriggered(NatsMsg<EffectTriggered> msg, CancellationToken ct = default)
+    [NatsConsumer("test.persons.*.save")]
+    public Task<NatsAck> HandleSavePerson(NatsMsg<Person> msg, CancellationToken ct = default)
     {
         if (msg.Data != null)
         {
-            Console.WriteLine($"Received effect triggered event with ID: {msg.Data.Id}");
-            Console.WriteLine($"URL: {msg.Data.Url}, Method: {msg.Data.Method}");
+            _logger.LogInformation($"Received request to save person with ID: {msg.Data.Id}");
+            _logger.LogInformation($"Name: {msg.Data.Name}, Age: {msg.Data.Age}, Addr: {msg.Data.Addr}");
         }
-        // Handle the message
-        return new NatsAck(true);
+        // ack the message
+        return Task.FromResult(new NatsAck(true));
     }
 
+
     /// <summary>
-    /// Example of using queue groups for load balancing
-    /// Multiple instances with the same queue group will share the workload
+    /// Handles update person events
+    /// This is a durable consumer
+    /// i.e. It will not miss any events if the app restarts thanks to JetStream
+    /// IMPORTANT: Make sure stream and consumer are already created
+    /// <code lang="bash">
+    /// nats stream add TEST_PERSONS_UPDATE --subjects "test.persons.*.update" --max-age 2h
+    /// nats consumer add TEST_PERSONS_UPDATE person-durable-consumer
+    /// Streams and consumers are typically handled outside code at infra level
+    /// </code
     /// </summary>
-    /// <param name="msg">The NATS message containing the EffectTriggered payload</param>
+    /// <param name="msg">The NATS message containing the Person payload</param>
     /// <param name="ct">Cancellation token for the async operation</param>
-    [NatsConsumer("CP.*.EffectTriggered.LoadBalanced", _queueGroupName: "effect-processors")]
-    public async Task HandleEffectTriggeredWithQueueGroup(NatsMsg<EffectTriggered> msg, CancellationToken ct = default)
+    [NatsConsumer("test.persons.*.update", _consumerId: "person-durable-consumer")]
+    public Task<NatsAck> HandleUpdatePerson(NatsMsg<Person> msg, CancellationToken ct = default)
     {
         if (msg.Data != null)
         {
-            Console.WriteLine($"[QUEUE GROUP] Worker received effect event with ID: {msg.Data.Id}");
-            Console.WriteLine($"[QUEUE GROUP] Processing URL: {msg.Data.Url}, Method: {msg.Data.Method}");
-
-            // Simulate some work
-            await Task.Delay(1000, ct).ConfigureAwait(false);
-            Console.WriteLine($"[QUEUE GROUP] Finished processing event ID: {msg.Data.Id}");
+            _logger.LogInformation($"Received request to update person with ID: {msg.Data.Id}");
+            _logger.LogInformation($"Name: {msg.Data.Name}, Age: {msg.Data.Age}, Addr: {msg.Data.Addr}");
         }
-    }
-}
-
-/// <summary>
-/// Example showing how to use the consumer registration system
-/// </summary>
-public class ConsumerHost
-{
-    /// <summary>
-    /// Demonstrates how to register and use NATS consumers
-    /// </summary>
-    public static async Task NatsConsumerRunner()
-    {
-        // create a host for DI
-        var host = Host.CreateDefaultBuilder()
-        // Configure logging providers & level explicitly (in addition to defaults)
-        .ConfigureLogging(logging =>
-        {
-            logging.ClearProviders(); // start clean so we control providers
-            logging.AddConsole();     // console output for examples
-            logging.SetMinimumLevel(LogLevel.Information);
-        })
-        .ConfigureServices(services =>
-        {
-            // register your consumer in DI container
-            services.AddSingleton<ConsumerExample>();
-            services.AddSingleton<JetStreamDurableConsumer>();
-            services.AddSingleton<HybridConsumerExample>();
-            services.AddSingleton<QueueGroupTestConsumer>();
-            services.AddSingleton<CloopsNatsClient>();
-            // register logging abstractions so ILogger<T> can be injected/resolved
-            services.AddLogging();
-
-        })
-        .Build();
-
-        await host.StartAsync().ConfigureAwait(false);
-
-        // Resolve client + map consumers using the container so ctor deps get injected
-        var client = host.Services.GetRequiredService<CloopsNatsClient>();
-        var consumeTask = client.MapConsumers(host.Services, throwOnDuplicate: false);
-
-        // sleep so that consumer registration is completed
-        Console.WriteLine("Consumer registration completed!");
-        Console.WriteLine("The following consumers are now listening:");
-        Console.WriteLine("- CP.*.EffectTriggered");
-        Console.WriteLine("Listening... Press Ctrl+C to quit.");
-
-        // disable for console interaction
-        // await consumeTask;
-
-
-        // enable this for console interaction
-        var sb = new SubjectBuilders.CP.CPSubjectBuilder(client);
-        var subject = sb.EventSubjects("cloudpathology_deesha").P_EffectTriggered;
-        ConsoleKeyInfo k;
-        do
-        {
-            await subject.Publish(new EffectTriggered
-            {
-                Id = Guid.NewGuid().ToString(),
-                Url = "https://example.com/effect",
-                Method = HttpMethod.Post,
-                Body = "from pub: human " + DateTime.Now,
-                Headers = new CPRequestHeaders { Cpt = "" },
-                Response = "response",
-                StatusCode = HttpStatusCode.Accepted,
-                SysCreated = DateTime.Now,
-                // Add other required properties if needed
-            }).ConfigureAwait(false);
-            Console.WriteLine("Published an event. You should see an output. Press 's' to send another one. Press 'q' to quit");
-            k = Console.ReadKey();
-        } while (k.KeyChar == 's');
-        Console.WriteLine("Bye!");
+        // ack the message
+        return Task.FromResult(new NatsAck(true));
     }
 }

@@ -24,7 +24,12 @@ public class NatsConsumerAttribute : Attribute
     /// <summary>
     /// NATS Queue Group Name
     /// Only valid for core subscriptions
-    /// Durable subscriptions control it through consumer spec
+    /// Durable subscriptions control it through consumerId
+    /// Following placeholders are supported. Placeholders are useful to get unique queue group names for different instances to enable broadcast situation
+    /// - `{POD_NAME}` - resolves to `POD_NAME` env var, or `HOSTNAME`, or machine name
+    /// - `{HOSTNAME}` - resolves to `HOSTNAME` env var, or machine name
+    /// - `{MACHINE_NAME}` - resolves to machine name
+    /// - `{ENV:VAR_NAME}` - resolves to any environment variable (e.g., `{ENV:MY_CUSTOM_VAR}`)
     /// </summary>
     public string QueueGroupName { get; init; } = "";
 
@@ -51,7 +56,7 @@ public class NatsConsumerAttribute : Attribute
             IsDurable = false;
             QueueGroupName = _QueueGroupName;
             // if non durable, then construct a unique consumer id per subject
-            ConsumerId = $"{_subject}-${QueueGroupName}";
+            ConsumerId = $"{_subject}-{QueueGroupName}";
 
         }
         else

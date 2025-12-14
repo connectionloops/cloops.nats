@@ -6,7 +6,8 @@ Welcome to the comprehensive documentation for the CLOOPS NATS SDK. This guide w
 
 - **[🚀 Local Development Setup](./LocalSetup.md)** - Set up your development environment with NATS server and CLI tools
 - **[⚡ Current SDK Functionality](./CurrentFunctionality.md)** - Overview of available features and capabilities
-- **[🚢 Release Process](./ReleaseProcess.md)** - Automated versioning and NuGet publishing workflow
+- **[⚡ Environment Variables](./EnvironmentVariables.md)** - Overview of available features and capabilities
+- **[🚢 Release Process](./ReleaseProcess.md)** - Versioning and NuGet publishing workflow
 
 ## 🤝 Contributing
 

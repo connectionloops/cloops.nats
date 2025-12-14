@@ -7,6 +7,8 @@ using NATS.Client.Core;
 using NATS.Client.JetStream;
 using CLOOPS.NATS.Meta;
 using System.Diagnostics;
+using System.Net;
+using System.Text.RegularExpressions;
 
 /// <summary>
 /// The Processor class thats sets up subcription and processor of incoming messages
@@ -84,7 +86,7 @@ internal class NatsSubscriptionProcessor
     }
 
     #region bootstreap
-    public void AddSubect(string subject, NatsConsumerAttribute _nca, Type _handlerClassType, MethodInfo _handler)
+    public void AddSubject(string subject, NatsConsumerAttribute _nca, Type _handlerClassType, MethodInfo _handler)
     {
         nca.Add(subject, _nca);
         handler.Add(subject, _handler);
@@ -472,17 +474,77 @@ internal class NatsSubscriptionProcessor
     }
 
     /// <summary>
+    /// Resolves placeholders in queue group names to support runtime values.
+    /// Supported placeholders:
+    /// - {POD_NAME} - resolves to POD_NAME env var, or HOSTNAME, or machine name
+    /// - {HOSTNAME} - resolves to HOSTNAME env var, or machine name
+    /// - {MACHINE_NAME} - resolves to machine name
+    /// - {ENV:VAR_NAME} - resolves to any environment variable
+    /// </summary>
+    private string ResolveQueueGroupPlaceholders(string queueGroupName)
+    {
+        if (string.IsNullOrEmpty(queueGroupName))
+            return queueGroupName;
+
+        string resolved = queueGroupName;
+
+        // Resolve {POD_NAME} - try POD_NAME env var first, then HOSTNAME, then machine name
+        if (resolved.Contains("{POD_NAME}"))
+        {
+            var podName = Environment.GetEnvironmentVariable("POD_NAME")
+                ?? Environment.GetEnvironmentVariable("HOSTNAME")
+                ?? Dns.GetHostName();
+            resolved = resolved.Replace("{POD_NAME}", podName);
+        }
+
+        // Resolve {HOSTNAME} - try HOSTNAME env var first, then machine name
+        if (resolved.Contains("{HOSTNAME}"))
+        {
+            var hostname = Environment.GetEnvironmentVariable("HOSTNAME")
+                ?? Dns.GetHostName();
+            resolved = resolved.Replace("{HOSTNAME}", hostname);
+        }
+
+        // Resolve {MACHINE_NAME} - use machine name
+        if (resolved.Contains("{MACHINE_NAME}"))
+        {
+            var machineName = Dns.GetHostName();
+            resolved = resolved.Replace("{MACHINE_NAME}", machineName);
+        }
+
+        // Resolve {ENV:VAR_NAME} pattern
+        var envVarPattern = Regex.Match(resolved, @"\{ENV:([^}]+)\}");
+        while (envVarPattern.Success)
+        {
+            var envVarName = envVarPattern.Groups[1].Value;
+            var envVarValue = Environment.GetEnvironmentVariable(envVarName) ?? "";
+            resolved = resolved.Replace($"{{ENV:{envVarName}}}", envVarValue);
+            envVarPattern = envVarPattern.NextMatch();
+        }
+
+        return resolved;
+    }
+
+    /// <summary>
     /// Non-durable Core NATS subscription.
     /// </summary>
     private IAsyncEnumerable<NatsMsg<byte[]>> GetCoreSubscription(CancellationToken ct)
     {
         var subject = Subjects.First();
+        var nca = this.nca[subject];
+
+        // Resolve placeholders in queue group name at runtime
+        var resolvedQueueGroupName = ResolveQueueGroupPlaceholders(nca.QueueGroupName);
+
+        // If queue group name is empty, use consumerId; otherwise use resolved queue group name
+        var queueGroup = string.IsNullOrEmpty(resolvedQueueGroupName) ? consumerId : resolvedQueueGroupName;
+
         var subscription = client.SubscribeAsync<byte[]>(
             subject,
-            queueGroup: consumerId,
+            queueGroup: queueGroup,
             cancellationToken: ct);
 
-        logger.LogInformation("Subscribed to {Subject} with queue group: {QueueGroup}", subject, consumerId ?? "none");
+        logger.LogInformation("Subscribed to {Subject} with queue group: {QueueGroup}", subject, queueGroup ?? "none");
 
         return subscription;
     }

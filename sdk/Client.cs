@@ -18,6 +18,11 @@ namespace CLOOPS.NATS;
 public interface ICloopsNatsClient : INatsClient
 {
     /// <summary>
+    /// Default JS context
+    /// </summary>
+    public INatsJSContext JsContext { get; }
+
+    /// <summary>
     /// Creates a JetStream Context
     /// </summary>
     /// <returns></returns>
@@ -269,7 +274,7 @@ public class CloopsNatsClient : ICloopsNatsClient
                         sub = new NatsSubscriptionProcessor(sp, this, consumerAttr.ConsumerId, _IsDurable: consumerAttr.IsDurable);
                         consumerIdToSubscriptionProcessor.Add(consumerAttr.ConsumerId, sub);
                     }
-                    sub.AddSubect(consumerAttr.Subject, consumerAttr, type, method);
+                    sub.AddSubject(consumerAttr.Subject, consumerAttr, type, method);
                 }
             }
             foreach (var sub in consumerIdToSubscriptionProcessor.Values)

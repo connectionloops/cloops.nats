@@ -36,8 +36,42 @@ internal class CloopsSerializer<T> : INatsSerialize<T>, INatsDeserialize<T>
 
     public T Deserialize(in ReadOnlySequence<byte> data)
     {
-        // from sdk standpoint, we always consume the data as a byte[]
-        // when we pass to handler function that's when we deserialize it
-        return (T)(object)data.ToArray();
+        // Convert ReadOnlySequence<byte> to byte[] for deserialization
+        var bytes = data.ToArray();
+        var type = typeof(T);
+
+        // Handle special types that need direct byte manipulation (not JSON)
+        if (type == typeof(byte[]))
+        {
+            return (T)(object)bytes;
+        }
+        else if (type == typeof(string))
+        {
+            // Since Serialize always produces JSON, we need to deserialize as JSON first
+            // This handles JSON-encoded strings (with quotes) correctly
+            // If JSON deserialization fails, fall back to UTF-8 decoding for raw strings
+            try
+            {
+                var jsonString = System.Text.Json.JsonSerializer.Deserialize<string>(bytes, BaseNatsUtil.JsonSerializerOptions);
+                if (jsonString != null)
+                    return (T)(object)jsonString;
+            }
+            catch
+            {
+                // If JSON deserialization fails, treat as raw UTF-8 string
+            }
+            // Fallback to UTF-8 decoding for raw string payloads
+            return (T)(object)Encoding.UTF8.GetString(bytes);
+        }
+        else if (type == typeof(void))
+        {
+            return default(T)!;
+        }
+
+        // For all other types (including primitives like int, long, bool, float, double),
+        // use JSON deserialization since Serialize always produces JSON
+        // JsonSerializer.Deserialize handles primitives correctly when they're JSON-encoded
+        return System.Text.Json.JsonSerializer.Deserialize<T>(bytes, BaseNatsUtil.JsonSerializerOptions)
+            ?? throw new InvalidOperationException($"Failed to deserialize to {type.Name}");
     }
 }

@@ -99,7 +99,26 @@ public class BaseNatsUtil
         object? payload = null;
         if (payloadType == typeof(string))
         {
-            payload = Encoding.UTF8.GetString(data ?? Array.Empty<byte>());
+            // Since data may be JSON-encoded (from CloopsSerializer), try JSON deserialization first
+            // This handles JSON-encoded strings (with quotes) correctly
+            // If JSON deserialization fails, fall back to UTF-8 decoding for raw strings
+            try
+            {
+                var jsonString = JsonSerializer.Deserialize<string>(data ?? Array.Empty<byte>(), JsonSerializerOptions);
+                if (jsonString != null)
+                {
+                    payload = jsonString;
+                }
+                else
+                {
+                    payload = Encoding.UTF8.GetString(data ?? Array.Empty<byte>());
+                }
+            }
+            catch
+            {
+                // If JSON deserialization fails, treat as raw UTF-8 string
+                payload = Encoding.UTF8.GetString(data ?? Array.Empty<byte>());
+            }
         }
         else if (payloadType == typeof(int))
         {

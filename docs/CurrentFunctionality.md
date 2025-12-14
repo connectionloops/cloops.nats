@@ -2,89 +2,40 @@
 
 This document outlines the currently available features and capabilities of the CLOOPS NATS SDK. The SDK is designed to provide type-safe, reliable messaging patterns for distributed microservices.
 
+## 📑 Index
+
+Quick navigation to key features:
+
+- [Architecture Overview](#️-architecture-overview)
+- [Available Features](#️-available-features)
+  - [Message Subscription & Consumption](#-message-subscription--consumption)
+  - [JetStream Durable Consumers](#-jetstream-durable-consumers)
+  - [High-Performance Processing](#-high-performance-processing)
+  - [Distributed Locking](#-distributed-locking)
+  - [Queue Groups Implementation](#-queue-groups-implementation)
+  - [Request-Reply Communication](#-request-reply-communication)
+  - [Metrics & Observability](#-metrics--observability)
+  - [Token Minting Service](#-token-minting-service)
+  - [Subject Builders (External Package)](#-subject-builders-external-package)
+  - [NATS Core Publishing](#-nats-core-publishing)
+  - [JetStream Publishing](#-jetstream-publishing)
+- [SDK Components](#-sdk-components)
+- [Example Workflows](#-example-workflows)
+- [Work In Progress](#-work-in-progress)
+
 ## 🏗️ Architecture Overview
 
-The SDK follows a layered architecture that enforces type safety and provides clear separation of concerns:
+The SDK provides a framework for building reliable, type-safe NATS messaging applications with a clean separation of concerns:
 
-- **Messages Layer**: Strongly-typed message schemas with compile-time validation
-- **Subjects Layer**: Type-safe subject builders with capability-based prefixes
-- **Transport Layer**: Abstraction over NATS Core and JetStream protocols
-- **Consumer Layer**: Attribute-driven message consumption with automatic routing
-- **Client Layer**: High-level API for publishing and consuming messages
+- **Client Layer**: High-level API for connecting to NATS and performing operations (publish, subscribe, request-reply)
+- **Consumer Framework**: Attribute-driven message consumption with automatic routing and type-safe handling
+- **Transport Abstraction**: Seamless support for both NATS Core and JetStream protocols
+- **Infrastructure Services**: Built-in support for metrics collection, distributed locking, and token minting
+- **Serialization**: JSON serialization with customizable options for message encoding/decoding
+
+**Note**: Message schemas, subject builders, and subject definitions are defined externally (typically in a separate schema package). The SDK works with any strongly-typed message types and subject strings.
 
 ## ✅ Available Features
-
-### 📋 Subject Builders
-
-**Purpose**: Provide a statically-typed, zero-ambiguity way to construct NATS subjects.
-
-**Key Benefits**:
-
-- **Compile-time safety**: No runtime errors from malformed subjects
-- **Capability enforcement**: Subject prefixes clearly indicate intended usage patterns
-- **Zero guesswork**: IntelliSense and type system guide correct usage
-
-**Available Subject Types**:
-
-- `P_Subject`: Publish-only subjects for one-way message broadcasting
-- `R_Subject`: Request-reply subjects for synchronous communication patterns
-
-**Example Usage**:
-
-```csharp
-// Type-safe subject construction
-var subject = CPSubjectBuilder.GetEffectTriggeredSubject();
-// Compiler ensures you can only publish EffectTriggered messages to this subject
-```
-
-### 📤 NATS Core Publishing
-
-**Purpose**: Lightweight, fire-and-forget message publishing for high-throughput scenarios.
-
-**Characteristics**:
-
-- **At-most-once delivery**: Messages may be lost if no subscribers are available
-- **Low latency**: Minimal overhead for real-time communication
-- **Stateless**: No message persistence or durability guarantees
-
-**Use Cases**:
-
-- Real-time notifications
-- Telemetry data
-- Non-critical updates
-
-### 📦 JetStream Publishing
-
-**Purpose**: Durable, reliable message publishing with persistence and delivery guarantees.
-
-**Characteristics**:
-
-- **At-least-once delivery**: Messages are persisted and guaranteed delivery
-- **Stream persistence**: Messages stored in streams for replay and durability
-- **Acknowledgment support**: Confirm successful message processing
-- **ACK/NAK contract**: Implemented. Handlers return `Task<NatsAck>`; processor ACKs or NAKs JetStream messages accordingly.
-
-**Use Cases**:
-
-- Critical business events
-- Audit trails
-- Data synchronization between services
-
-### 🔄 Request-Reply Communication
-
-**Purpose**: Synchronous communication pattern for immediate response requirements.
-
-**Characteristics**:
-
-- **Bidirectional**: Send request and await typed response
-- **Timeout support**: Configurable timeouts for reliability
-- **Type safety**: Both request and response are strongly typed
-
-**Use Cases**:
-
-- Data queries
-- Service-to-service API calls
-- Validation requests
 
 ### 📥 Message Subscription & Consumption
 
@@ -98,36 +49,13 @@ var subject = CPSubjectBuilder.GetEffectTriggeredSubject();
 - **Automatic ACK/NAK (JetStream)**: After handler execution, the processor calls `AckAsync` or `NakAsync` based on the handler’s result, guaranteeing at-least-once delivery.
 - **Exception safety**: If a handler throws, the processor logs the error and issues a NAK (JetStream), enabling retry/DLQ per configuration.
 
-**Consumer Registration (Updated for JetStream ACK/NAK):**
+**Example**:
 
 ```csharp
-// JetStream consumer with explicit ACK/NAK
-[NatsConsumer("CP.*.EffectTriggered.Durable", _durable: true, _consumerId: "effect-durable")]
-public async Task<NatsAck> ProcessDurableEffect(NatsMsg<EffectTriggered> msg, CancellationToken ct)
+[NatsConsumer("events.process")]
+public async Task<NatsAck> HandleEvent(NatsMsg<Event> msg, CancellationToken ct)
 {
-    try
-    {
-        // Business logic here
-        await ProcessCriticalEffect(msg.Data);
-        return NatsAck.Success; // Message will be ACKed
-    }
-    catch (Exception ex)
-    {
-        // Log and trigger NAK for retry
-        Console.WriteLine($"Error: {ex.Message}");
-        return NatsAck.Fail; // Message will be NAKed
-    }
-}
-```
-
-**Queue Groups for Load Balancing (Unchanged):**
-
-```csharp
-[NatsConsumer("CP.*.EffectTriggered.LoadBalanced", _queueGroupName: "effect-processors")]
-public async Task<NatsAck> HandleLoadBalancedEffect(NatsMsg<EffectTriggered> msg, CancellationToken ct = default)
-{
-    // This consumer will share load with other "effect-processors" queue group members
-    await ProcessEffectInLoadBalancedGroup(msg.Data);
+    await ProcessEvent(msg.Data);
     return NatsAck.Success;
 }
 ```
@@ -154,10 +82,10 @@ public async Task<NatsAck> HandleLoadBalancedEffect(NatsMsg<EffectTriggered> msg
 
 - **Retry behavior**: Redelivery timing and limits are controlled by JetStream consumer/stream config (e.g., MaxDeliver, Backoff, DLQ policies).
 
-**Durable Consumer Registration (Updated for ACK/NAK):**
+**Example**:
 
 ```csharp
-[NatsConsumer("CP.*.EffectTriggered.Durable", _durable: true, _consumerId: "effect-durable")]
+[NatsConsumer("CP.*.EffectTriggered.Durable", _consumerId: "effect-durable")]
 public async Task<NatsAck> ProcessDurableEffect(NatsMsg<EffectTriggered> msg, CancellationToken ct)
 {
     try
@@ -167,38 +95,51 @@ public async Task<NatsAck> ProcessDurableEffect(NatsMsg<EffectTriggered> msg, Ca
     }
     catch (Exception ex)
     {
-        Console.WriteLine(ex);
-        return NatsAck.Fail;    // SDK will Nak (JetStream retries per config)
+        return NatsAck.Fail; // SDK will Nak (JetStream retries per config)
     }
 }
 ```
 
-### ⚡ High-Performance Batch Processing
+### ⚡ High-Performance Processing
 
-**Purpose**: Optimized message processing for high-throughput scenarios.
+**Purpose**: Optimized message processing with configurable parallelism and backpressure control.
 
 **Key Features**:
 
-- **Configurable parallelism**: Control concurrent processing with `maxDOP`
-- **Batch formation**: Group messages for efficient processing
-- **Timeout control**: Balance latency vs. throughput with `batchTimeoutMs`
-- **Resource management**: Prevent memory overflow with `channelCapacity`
+- **Configurable parallelism**: Control concurrent message processing via environment variables
+- **Backpressure management**: Bounded queues prevent memory overflow
+- **Resource management**: Environment-based configuration for production flexibility
 
-**Batch Processing Configuration**:
+**Configuration via Environment Variables**:
+
+The SDK supports high-performance processing through environment variables (see [Environment Variables Documentation](./EnvironmentVariables.md)):
+
+- **`NATS_CONSUMER_MAX_DOP`**: Maximum degree of parallelism (default: 128)
+  - Controls how many messages can be processed concurrently
+  - Higher values increase throughput but require more CPU/memory
+- **`NATS_SUBSCRIPTION_QUEUE_SIZE`**: Maximum queue capacity per subscription (default: 20,000)
+  - Controls backpressure when processing is slower than message arrival
+  - When full, the SDK applies backpressure to prevent memory overflow
+
+**Example Consumer**:
 
 ```csharp
-[NatsConsumer("analytics.events",
-    _maxDOP: 100,           // 100 parallel processors
-    _useBatching: true,     // Enable batch processing
-    _batchTimeoutMs: 50,    // 50ms batch window
-    _channelCapacity: 10000)] // Internal queue size
+[NatsConsumer("analytics.events")]
 public async Task<NatsAck> ProcessAnalytics(NatsMsg<AnalyticsEvent> msg, CancellationToken ct = default)
 {
-    // High-throughput optimized processing
+    // Processing happens with parallelism and backpressure controlled by environment variables
     await analyticsService.ProcessEvent(msg.Data);
     return NatsAck.Success;
 }
 ```
+
+**Performance Tuning**:
+
+- For high-throughput scenarios, increase `NATS_CONSUMER_MAX_DOP` (e.g., 200-500)
+- Monitor queue depth; if it consistently reaches capacity, either:
+  - Increase processing speed (optimize handlers)
+  - Increase `NATS_SUBSCRIPTION_QUEUE_SIZE` (with more memory)
+  - Scale horizontally (more consumer instances)
 
 ### 🔒 Distributed Locking
 
@@ -211,6 +152,23 @@ public async Task<NatsAck> ProcessAnalytics(NatsMsg<AnalyticsEvent> msg, Cancell
 - **Timeout support**: Configurable timeout for lock acquisition attempts
 - **Owner identification**: Track which instance holds the lock
 - **Resource isolation**: Different keys provide independent locks
+
+**Quick Example**:
+
+```csharp
+var cnc = new CloopsNatsClient();
+await cnc.SetupKVStoresAsync();
+
+var lockHandle = await cnc.AcquireDistributedLockAsync("my-resource");
+if (lockHandle != null)
+{
+    await using (lockHandle)
+    {
+        // Critical section - only this instance can access
+        await ProcessCriticalOperation();
+    }
+}
+```
 
 **Setup Requirements**:
 
@@ -316,26 +274,232 @@ else
 - **No configuration required**: Just specify queue group name in attribute
 - **Multiple queue groups**: Different groups can process same subjects independently
 
-**Queue Group Scenarios**:
+**Examples**:
 
 ```csharp
-// No queue group - all instances receive all messages
+// No queue group - all instances receive all messages (broadcast)
 [NatsConsumer("notifications.all")]
 public async Task<NatsAck> HandleAllNotifications(NatsMsg<Notification> msg, CancellationToken ct)
 {
-    await Task.CompletedTask;
     return NatsAck.Success;
 }
 
 // Queue group - load balanced across group members
-[NatsConsumer("orders.process", _queueGroupName: "order-workers")]
+[NatsConsumer("orders.process", _QueueGroupName: "order-workers")]
 public async Task<NatsAck> ProcessOrder(NatsMsg<Order> msg, CancellationToken ct)
 {
-    await Task.CompletedTask;
     return NatsAck.Success;
 }
-
 ```
+
+### 🔄 Request-Reply Communication
+
+**Purpose**: Synchronous communication pattern for immediate response requirements.
+
+**Characteristics**:
+
+- **Bidirectional**: Send request and await typed response
+- **Timeout support**: Configurable timeouts for reliability
+- **Type safety**: Both request and response are strongly typed
+
+**Use Cases**:
+
+- Data queries
+- Service-to-service API calls
+- Validation requests
+
+**Example**:
+
+**Responder using annotation-based handler:**
+
+```csharp
+// Responder handler using [NatsConsumer] attribute
+[NatsConsumer("service.query")]
+public async Task<NatsAck> HandleQuery(NatsMsg<string> msg, CancellationToken ct)
+{
+    // Process the request
+    var result = $"Processed: {msg.Data}";
+
+    // Return NatsAck with reply data - SDK automatically sends reply to requester
+    return new NatsAck(true, result);
+}
+```
+
+**Sending request from NATS CLI:**
+
+```bash
+# Send request and await response
+nats req service.query "request-data"
+```
+
+**Or using SDK programmatically:**
+
+```csharp
+var cnc = new CloopsNatsClient();
+var response = await cnc.RequestAsync<string, string>("service.query", "request-data");
+Console.WriteLine($"Response: {response.Data}");
+```
+
+### 📊 Metrics & Observability
+
+**Purpose**: Built-in metrics collection for monitoring message processing performance.
+
+**Key Features**:
+
+- **Automatic metrics**: SDK records message processing duration and status
+- **System.Diagnostics.Metrics integration**: Uses standard .NET metrics infrastructure
+- **Function-level tracking**: Metrics tagged with handler function name
+- **Status tracking**: Success/failure and retryability information
+
+**Available Metrics**:
+
+- **`nats_sub_msg_process_milliseconds`**: Histogram tracking message processing time
+  - Labels: `fn` (function name), `status` (success/fail), `retryable` (true/false)
+  - Automatically generates count, sum, and bucket metrics for quantiles
+
+**Quick Example**:
+
+```csharp
+// Register metrics service
+services.AddSingleton<INatsMetricsService, NatsMetricsService>();
+
+// Metrics automatically tracked for all handlers
+[NatsConsumer("events.process")]
+public async Task<NatsAck> ProcessEvent(NatsMsg<Event> msg, CancellationToken ct)
+{
+    await ProcessMessage(msg.Data);
+    return NatsAck.Success; // Duration and status automatically recorded
+}
+```
+
+**Metrics Integration**:
+
+The `NatsMetricsService` uses `System.Diagnostics.Metrics`, which integrates with:
+
+- OpenTelemetry exporters
+- Application Insights
+- Prometheus
+- Custom metrics collectors
+
+### 🔑 Token Minting Service
+
+> Only applicable if you are using NATS with decentralized auth.
+
+This is typically used to issue short lived JWT to UI.
+
+**Purpose**: Programmatically mint NATS user credentials (JWT tokens) for dynamic user provisioning.
+
+**Key Features**:
+
+- **Dynamic credential generation**: Create NATS credentials on-demand
+- **Fine-grained permissions**: Specify allow/deny lists for publish and subscribe
+- **Expiration control**: Set credential expiration times
+- **Environment-based configuration**: Secure credential storage via environment variables
+
+**Security Note**: This service requires account signing credentials and should only be used in trusted, secure services.
+
+**Quick Example**:
+
+```csharp
+// Register service (uses env vars: NATS_ACCOUNT_SIGNING_SEED, NATS_ACCOUNT_PUBLIC_KEY)
+services.AddSingleton<INatsTokenMintingService, NatsTokenMintingService>();
+
+// Mint credentials
+var creds = mintingService.MintNatsUserCreds(new NatsCredsRequest
+{
+    userName = "user-001",
+    allowPubs = new List<string> { "events.>" },
+    allowSubs = new List<string> { "events.>" },
+    expMs = 3600_000 // 1 hour
+});
+```
+
+**Environment Variables** (see [Environment Variables](./EnvironmentVariables.md)):
+
+- `NATS_ACCOUNT_SIGNING_SEED`: Account signing key seed (highly confidential)
+- `NATS_ACCOUNT_PUBLIC_KEY`: Main account public key
+
+### 📋 Subject Builders (External Package)
+
+**Purpose**: Type-safe subject construction (available via external schema packages, e.g. for connection loops, `cloops.nats.schema`). You can build your own package that provides schema.
+
+**Note**: Subject builders are defined in external packages and are **optional**. You can use plain subject strings directly with the SDK.
+
+**Using Subject Builders** (if available from external package):
+
+```csharp
+var sb = new CPSubjectBuilder(cnc); // From external schema package
+var subject = sb.EventSubjects("cloudpathology_test").P_EffectTriggered;
+await subject.Publish(new EffectTriggered { Id = "123" });
+```
+
+**Using Plain Subject Strings** (SDK-native approach):
+
+```csharp
+var cnc = new CloopsNatsClient();
+await cnc.PublishAsync("CP.test.EffectTriggered", new EffectTriggered { Id = "123" });
+```
+
+using a schema package will allow you to -
+
+- **Strong typing** for all messages, subjects and their associations. This is provided through `cloops.nats.schema`.
+- **Compile-time safety** for event publishing
+- **Well-defined patterns** for message governance
+
+These schemas are specific to organization functions and therefore are not included in this SDK. You'd typically want to only allow one schema per subject for reliability. Make sure to version your schemas to be backward compatible.
+
+### 📤 NATS Core Publishing
+
+**Purpose**: Lightweight, fire-and-forget message publishing for high-throughput scenarios.
+
+**Characteristics**:
+
+- **At-most-once delivery**: Messages may be lost if no subscribers are available
+- **Low latency**: Minimal overhead for real-time communication
+- **Stateless**: No message persistence or durability guarantees
+
+**Use Cases**:
+
+- Real-time notifications
+- Telemetry data
+- Non-critical updates
+
+**Example**:
+
+```csharp
+var cnc = new CloopsNatsClient();
+var sb = new CPSubjectBuilder(cnc);
+var subject = sb.EventSubjects("cloudpathology_test").P_EffectTriggered;
+await subject.Publish(new EffectTriggered { Id = "123" });
+```
+
+### 📦 JetStream Publishing
+
+**Purpose**: Durable, reliable message publishing with persistence and delivery guarantees.
+
+**Characteristics**:
+
+- **At-least-once delivery**: Messages are persisted and guaranteed delivery
+- **Stream persistence**: Messages stored in streams for replay and durability
+- **Acknowledgment support**: Confirm successful message processing
+- **ACK/NAK contract**: Implemented. Handlers return `Task<NatsAck>`; processor ACKs or NAKs JetStream messages accordingly.
+
+**Use Cases**:
+
+- Critical business events
+- Audit trails
+- Data synchronization between services
+
+**Example**:
+
+```csharp
+var cnc = new CloopsNatsClient();
+var sb = new CPSubjectBuilder(cnc);
+var subject = sb.EventSubjects("cloudpathology_test").P_EffectTriggered;
+await subject.StreamPublish(new EffectTriggered { Id = "123" }, dedupeId: "unique-123");
+```
+
+> Please note: subject builders, subjects and their associated message type bindings are external to this SDK. Please use your own implementations for these.
 
 ## 🏛️ Examples Project Architecture
 
@@ -351,47 +515,15 @@ public async Task<NatsAck> ProcessOrder(NatsMsg<Order> msg, CancellationToken ct
 **Available Examples**:
 
 - `dotnet run pub` - Basic NATS Core publishing
-- `dotnet run spub` - JetStream publishing with persistence
 - `dotnet run req` - Request-reply communication
-- `dotnet run reply` - Reply handler setup
-- `dotnet run sub` - Consumer examples
-- `dotnet run subjects` - Subject builder demonstrations
-- `dotnet run batch` - High-performance batch processing
-- `dotnet run queuetest` - Queue group load balancing demo
+- `dotnet run locking` - distributed lock demo
+- `dotnet run minting` - jwt minting demo
 
 **Example Files**:
 
-- **`BasicExamples.cs`**: Command-line interface demonstrating all SDK features
-- **`ConsumerExample.cs`**: Comprehensive consumer examples with hosting integration
-- **`JetStreamDurableConsumer.cs`**: JetStream durable consumer patterns
-- **`QueueGroupTestConsumer.cs`**: Complete queue group testing scenarios
-
-## 🚧 Work In Progress
-
-### Message Acknowledgment & Retry
-
-- **Retry mechanisms**: Retries are handled by JetStream for NAKed messages per consumer/stream configuration.
-- **Exponential backoff**: **Not implemented in SDK** (configure via JetStream consumer options).
-- **Dead letter queues (DLQ)**: **Not implemented in SDK** (configure DLQ/move-to-stream in JetStream).
-
-### Advanced Serialization
-
-- **Custom serializers**: Support for serialization beyond JSON
-- **Binary protocols**: Protobuf, MessagePack, Avro support
-- **Schema evolution**: Backward/forward compatibility handling
-
-### Observability & Metrics
-
-- **Performance metrics**: Message throughput, latency, error rates
-- **Health checks**: Consumer health and availability monitoring
-- **Distributed tracing**: OpenTelemetry integration
-- **Logging integration**: Structured logging with correlation IDs
-
-### Stream Management
-
-- **Automatic stream creation**: Dynamic JetStream stream provisioning
-- **Stream configuration**: Programmatic stream setup and management
-- **Retention policies**: Configurable message retention strategies
+- **`ConsumerExample.cs`**: Comprehensive consumer examples
+- **`NatsConsumerHost.cs`**: Host and DI setup for consumers
+- **`TokenMintingExample.cs`**: How to mint a JWT programmatically. Note: only works when you are using NATS decentralized auth.
 
 ## 🔧 SDK Components
 
@@ -408,176 +540,19 @@ public async Task<NatsAck> ProcessOrder(NatsMsg<Order> msg, CancellationToken ct
 - **`NatsSubscriptionQueue.cs`**: Queue management for consumer groups and batch processing
 - **`NatsConsumerAttribute.cs`**: Attribute for marking consumer methods with configuration options
 
-**Type System & Utilities**:
+**Serialization & Utilities**:
 
-- **`Util.cs`**: Type conversion utilities for NatsMsg processing and JSON serialization
+- **`Util.cs`** / **`BaseNatsUtil`**: Type conversion utilities for NatsMsg processing and JSON serialization
+- **`CloopsSerializer.cs`**: Custom serializer implementation with camelCase naming and flexible number handling
 - **Method overloading**: Handles both `NatsMsg<byte[]>` and `NatsJSMsg<byte[]>` message types
-- **JSON serialization**: Configured with camelCase naming and flexible number handling
 
-### Subject Builders
+**Infrastructure Services**:
 
-**Core Subject Building**:
+- **`NatsMetricsService.cs`**: Metrics collection using System.Diagnostics.Metrics
+- **`NatsTokenMintingService.cs`**: Programmatic NATS credential generation
+- **`KvDistributedLock.cs`**: Distributed locking using NATS Key-Value stores
+- **`SubjectMatcher.cs`**: Efficient subject pattern matching for wildcard subscriptions
 
-- **`CPSubjectBuilder.cs`**: Subject builder for Connection Loops domains
-- **`CPEventsSubjectBuilder.cs`**: Specialized builder for CP events
-- **`P_Subject.cs`**: Publish-only subject definitions
-- **`R_Subject.cs`**: Request-reply subject definitions
+**Note**: Subject builders, message schemas, and event definitions are provided by external packages (e.g., `cloops.nats.schema`). The SDK works with any strongly-typed message types.
 
-### Event Schemas
-
-**Event Definitions**:
-
-- **Location**: `/Events/` directory hierarchy
-- **Organization**: Organized by domain (e.g., `CP/Infra/`)
-- **Type safety**: Strongly-typed event classes with validation
-- **`EffectTriggered.cs`**: Primary event type for demonstrations
-
-### Examples Project
-
-**Production Examples**:
-
-- **`examples/BasicExamples.cs`**: Command-line interface demonstrating all SDK features
-- **`examples/ConsumerExample.cs`**: Comprehensive consumer examples with DI integration
-- **`examples/JetStreamDurableConsumer.cs`**: JetStream durable consumer patterns
-- **`examples/QueueGroupTestConsumer.cs`**: Queue group testing and validation scenarios
-
-## 📊 Example Workflows
-
-### Publishing an Event
-
-**Complete Publishing Workflow**:
-
-1. Use subject builder to get type-safe subject
-2. Create strongly-typed event object
-3. Choose publishing method (NATS Core vs JetStream)
-4. SDK enforces type compatibility at compile time
-
-```csharp
-// Complete publishing example
-var cnc = new CloopsNatsClient();
-var sb = new CPSubjectBuilder(cnc);
-var subject = sb.EventSubjects("cloudpathology_test").P_EffectTriggered;
-
-EffectTriggered payload = new()
-{
-    Id = Guid.NewGuid().ToString(),
-    Url = "https://example.com/effect",
-    Method = HttpMethod.Post,
-    Body = "{\"test\": \"data\"}",
-    Headers = new() { Cpt = "auth-token" },
-    StatusCode = HttpStatusCode.OK,
-    Response = "success",
-    SysCreated = DateTime.UtcNow
-};
-
-// NATS Core publishing
-await subject.Publish(payload).ConfigureAwait(false);
-
-// JetStream publishing with deduplication
-await subject.StreamPublish(payload, dedupeId: $"effect-{payload.Id}").ConfigureAwait(false);
-```
-
-### Setting Up Message Consumers
-
-**Complete Consumer Setup Workflow**:
-
-1. Create consumer class with `[NatsConsumer]` attributes
-2. Register consumers with dependency injection
-3. Start subscription service
-4. SDK automatically routes messages to handlers
-
-```csharp
-// Consumer class
-public class EventProcessor
-{
-    [NatsConsumer("CP.*.EffectTriggered")]
-    public async Task<NatsAck> ProcessEffect(NatsMsg<EffectTriggered> msg, CancellationToken ct)
-    {
-        Console.WriteLine($"Processing effect: {msg.Data.Id}");
-        await Task.CompletedTask;
-        return NatsAck.Success; // Core ignores, JetStream would Ack/Nak if durable
-    }
-
-    [NatsConsumer("CP.*.EffectTriggered.Bulk", _queueGroupName: "bulk-processors")]
-    public async Task<NatsAck> ProcessBulkEffect(NatsMsg<EffectTriggered> msg, CancellationToken ct)
-    {
-        await ProcessInBulk(msg.Data);
-        return NatsAck.Success;
-    }
-
-    // If you want to keep a durable example here, align it too:
-    [NatsConsumer("CP.*.EffectTriggered.Durable", _durable: true, _consumerId: "effect-durable")]
-    public async Task<NatsAck> ProcessDurableEffect(NatsMsg<EffectTriggered> msg, CancellationToken ct)
-    {
-        try
-        {
-            await ProcessCriticalEffect(msg.Data);
-            return NatsAck.Success; // SDK will Ack
-        }
-        catch
-        {
-            return NatsAck.Fail;    // SDK will Nak (JetStream retries per config)
-        }
-    }
-}
-
-// Consumer registration and startup
-var host = Host.CreateDefaultBuilder()
-    .ConfigureServices(services =>
-    {
-        services.AddSingleton<EventProcessor>();
-        services.AddSingleton<QueueGroupTestConsumer>();
-        services.AddSingleton<JetStreamDurableConsumer>();
-        services.AddNatsSubscriptionProcessor();
-    })
-    .Build();
-
-await host.RunAsync();
-```
-
-### Request-Reply Pattern
-
-**Complete Request-Reply Workflow**:
-
-1. Set up reply handler for incoming requests
-2. Use typed request/response objects
-3. Send requests with timeout handling
-4. Handle response or timeout scenarios
-
-```csharp
-// Reply handler setup
-await foreach (NatsMsg<string> msg in cnc.SubscribeAsync<string>("test.requests"))
-{
-    var response = $"Processed: {msg.Data}";
-    await cnc.ReplyAsync(msg, response).ConfigureAwait(false);
-}
-
-// Request sender with error handling
-try
-{
-    var response = await cnc.RequestAsync<string, string>("test.requests", "request-data").ConfigureAwait(false);
-    Console.WriteLine($"Received response: {response}");
-}
-catch (TimeoutException)
-{
-    Console.WriteLine("Request timed out - no responders available");
-}
-```
-
-## 🎯 Upcoming Features
-
-**Planned Enhancements**:
-
-- **Enhanced subscription management**: Advanced subscription lifecycle control
-- **Automatic retry mechanisms**: Built-in retry policies and dead letter queues
-- **Metrics and observability integration**: OpenTelemetry and monitoring support
-- **Additional subject builders**: Support for new domains and event types
-- **Stream management utilities**: Automated JetStream stream provisioning
-- **Performance optimizations**: Further throughput and latency improvements
-
-**Not Currently Planned**:
-
-- **Message transformation**: In-flight message modification or routing
-- **Complex event processing**: Event correlation and stream processing
-- **Multi-tenancy**: Built-in tenant isolation and routing
-- **Schema registry**: Centralized schema management and evolution
+> There is an quick example of schema in examples folder.
