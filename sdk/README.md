@@ -1,92 +1,102 @@
 # CLOOPS NATS SDK
 
-> the words events are messages are same and are used Interchangeably.
+[![CI](https://github.com/connectionloops/cloops.nats/actions/workflows/ci.yml/badge.svg)](https://github.com/connectionloops/cloops.nats/actions/workflows/ci.yml)
+[![NuGet](https://img.shields.io/nuget/v/cloops.nats.svg)](https://www.nuget.org/packages/cloops.nats)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-This SDK enables you to build reliable distributed systems using NATS messaging system. It enables annotation based definitions to control behavior of your NATS subscribers.
+A modern, annotation-based SDK for building reliable distributed systems with NATS. Define your message consumers with simple attributes and let the framework handle the complexity.
 
-## Overview
+## Why NATS?
 
-Using NATS as communication layer for your distributed systems is quite impressive. You can implement sophisticated load balancing, fault tolerant systems that are location transparent and globally distributed.
+NATS is a powerful messaging system that enables you to build sophisticated, fault-tolerant distributed systems that are location-transparent and globally distributed.
 
-- **Leaner than http** - It's a binary protocol
-- **Less number of hops** - No load balancers, API gateways etc.
-- **Globally distributed** - You can distribute your applications across the globe without any kind of DNS and load balancing complexity. Check out [NATS super cluster](https://docs.nats.io/running-a-nats-service/configuration/gateways) for additional details
+- **Faster than HTTP** - Binary protocol with lower overhead
+- **Fewer hops** - Direct communication without load balancers or API gateways
+- **Globally distributed** - Deploy applications worldwide without DNS or complex load balancing. Learn more about [NATS super clusters](https://docs.nats.io/running-a-nats-service/configuration/gateways)
 
-Check out [this podcast from nats.fm](https://podcasts.apple.com/us/podcast/ep03-escaping-the-http-mindset-with-nats-io/id1700459773?i=1000625476010) for additional insights into this.
+> 💡 **Learn more**: Check out [this podcast from nats.fm](https://podcasts.apple.com/us/podcast/ep03-escaping-the-http-mindset-with-nats-io/id1700459773?i=1000625476010) for insights into NATS architecture.
 
-However, developers now a days expect annotation based definitions and dependency injection setups that are common across virtually any modern REST framework. With this project we are trying to supply similar framework to provide the same developer experience to teams that want to build their applications using NATS. Our hope is that this will reduce other differentiated work of consumer behavior handling.
+## Why This SDK?
 
-This framework helps you with -
+Modern developers expect annotation-based definitions and dependency injection—the same developer experience you get with REST frameworks like ASP.NET Core. This SDK brings that same simplicity to NATS, so you can focus on your business logic instead of boilerplate.
 
-- Defining your NATS subscribers with annotations
-- Provide back pressure in case of spikes
-- Control load balancing strategies (i.e. broadcasting, load balancing)
-- Works JetStream for building temporally decoupled systems.
+### What You Get
 
-> If you are building microservices then, we have a microservices focused SDK with all the bells and whistles built on top of cloops.nats. It is free and open source. Please check it out [here](https://github.com/connectionloops/cloops.microservices)
+- ✨ **Annotation-based consumers** - Define subscribers with simple attributes
+- 🛡️ **Built-in backpressure** - Automatic handling of traffic spikes
+- ⚖️ **Flexible load balancing** - Choose between broadcasting or load balancing strategies
+- 🚀 **JetStream support** - Build temporally decoupled systems with persistent messaging
+- 🔧 **Dependency injection** - Seamless integration with .NET's DI container
 
-### Quick Examples
+> 🎯 **Building microservices?** Check out our [microservices-focused SDK](https://github.com/connectionloops/cloops.microservices) built on top of `cloops.nats` and makes building microservices a breeze!
 
-**Broadcast with unique pod names (for Kubernetes/Docker)**
-
-To ensure each pod/instance receives all messages (broadcast), use runtime placeholders in the queue group name:
-
-```cs
-/// <summary>
-/// Broadcast scenario: Each pod gets a unique queue group name, so all pods receive all messages
-/// Supported placeholders: {POD_NAME}, {HOSTNAME}, {MACHINE_NAME}, {ENV:VAR_NAME}
-/// </summary>
-[NatsConsumer("test.broadcast", QueueGroupName = "pod-{POD_NAME}")]
-public Task<NatsAck> BroadcastHandler(NatsMsg<string> msg, CancellationToken ct = default)
-{
-    Console.WriteLine($"[Pod {Environment.GetEnvironmentVariable("POD_NAME")}] message received: {msg.Data}");
-    return Task.FromResult(new NatsAck(true));
-}
-```
-
-The SDK resolves placeholders at runtime:
-
-- `{POD_NAME}` - resolves to `POD_NAME` env var, or `HOSTNAME`, or machine name
-- `{HOSTNAME}` - resolves to `HOSTNAME` env var, or machine name
-- `{MACHINE_NAME}` - resolves to machine name
-- `{ENV:VAR_NAME}` - resolves to any environment variable (e.g., `{ENV:MY_CUSTOM_VAR}`)
-
-**Load balancing example**
-
-Use same QueueGroup Name for multiple instances
-
-```cs
-[NatsConsumer("test.lb", _QueueGroupName: "workers")]
-public async Task<NatsAck> HandleQueueGroup1(NatsMsg<string> msg, CancellationToken ct = default)
-{
-    Console.WriteLine($"LB - instance 1] message received: {msg.Data}");
-    await Task.Delay(100, ct).ConfigureAwait(false); // Simulate work
-    return new NatsAck(true);
-}
-```
-
-> Note: \_QueueGroupName is optional, and if you do not provide one the empty string is used. It still makes consumers load balanced
-
-> Note: JetStream subscriptions in cloops.nats are load balanced always (i.e. no broadcast)
+## Quick Start
 
 ### Installation
 
-Add cloops.nats package reference to your `.csproj` file. Please note we deliberately want all of our consumers to stay on latest version of the SDK.
+Add the `cloops.nats` package to your `.csproj` file:
 
 ```xml
 <PackageReference Include="cloops.nats" Version="*" />
 ```
 
-Once added, just to `dotnet restore` to pull in the SDK.
+Run `dotnet restore` to install the package.
 
-> Please note: to get our Connection Loops standard messages, subjects etc., you might need to pull in `cloops.nats.schema`
+> 💡 **Tip**: For Connection Loops standard messages and subjects, you may also need `cloops.nats.schema`.
 
-## Quickstarts
+### Examples
 
-Take a look at some examples [here](https://github.com/connectionloops/cloops.nats/tree/main/examples)
+**Broadcast Pattern (Kubernetes/Docker)**
 
-## Documentation
+Ensure each pod/instance receives all messages by using runtime placeholders in the queue group name:
 
-For detailed documentation, setup instructions, and contribution guidelines:
+```cs
+/// <summary>
+/// Broadcast: Each pod gets a unique queue group, so all pods receive all messages
+/// Supported placeholders: {POD_NAME}, {HOSTNAME}, {MACHINE_NAME}, {ENV:VAR_NAME}
+/// </summary>
+[NatsConsumer("test.broadcast", QueueGroupName = "pod-{POD_NAME}")]
+public Task<NatsAck> BroadcastHandler(NatsMsg<string> msg, CancellationToken ct = default)
+{
+    Console.WriteLine($"[Pod {Environment.GetEnvironmentVariable("POD_NAME")}] Received: {msg.Data}");
+    return Task.FromResult(new NatsAck(true));
+}
+```
 
-📚 **[View Complete Documentation](https://github.com/connectionloops/cloops.nats/tree/main/docs)**
+**Load Balancing Pattern**
+
+Distribute messages across multiple instances using the same queue group:
+
+```cs
+[NatsConsumer("test.lb", QueueGroupName = "workers")]
+public async Task<NatsAck> HandleMessage(NatsMsg<string> msg, CancellationToken ct = default)
+{
+    Console.WriteLine($"Instance received: {msg.Data}");
+    await Task.Delay(100, ct).ConfigureAwait(false); // Simulate work
+    return new NatsAck(true);
+}
+```
+
+**Runtime Placeholders**
+
+The SDK resolves placeholders dynamically:
+
+- `{POD_NAME}` → `POD_NAME` env var, falls back to `HOSTNAME` or machine name
+- `{HOSTNAME}` → `HOSTNAME` env var, falls back to machine name
+- `{MACHINE_NAME}` → Machine name
+- `{ENV:VAR_NAME}` → Any environment variable (e.g., `{ENV:MY_CUSTOM_VAR}`)
+
+> 📝 **Note**: `QueueGroupName` is optional. If omitted, an empty string is used, which still enables load balancing. JetStream subscriptions are always load-balanced (no broadcast support).
+
+## Learn More
+
+- 📖 **[Examples](https://github.com/connectionloops/cloops.nats/tree/main/examples)** - See real-world usage patterns
+- 📚 **[Full Documentation](https://github.com/connectionloops/cloops.nats/tree/main/docs)** - Detailed guides, setup instructions, and API reference
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
