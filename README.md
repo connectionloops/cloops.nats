@@ -27,7 +27,7 @@ Modern developers expect annotation-based definitions and dependency injection�
 - ⚖️ **Flexible load balancing** - Choose between broadcasting or load balancing strategies
 - 🚀 **JetStream support** - Build temporally decoupled systems with persistent messaging
 - 🔧 **Dependency injection** - Seamless integration with .NET's DI container
-- ✅ **Automatic message validation** - Messages with a `Validate()` method are automatically validated before processing. Invalid messages are never sent to your handlers
+- ✅ **Automatic message validation** - Messages with a `Validate()` method are automatically validated before processing. Invalid messages are never sent to your handlers.
 
 > 🎯 **Building microservices?** Check out our [microservices-focused SDK](https://github.com/connectionloops/cloops.microservices) built on top of `cloops.nats` and makes building microservices a breeze!
 
@@ -43,7 +43,7 @@ Add the `cloops.nats` package to your `.csproj` file:
 
 Run `dotnet restore` to install the package.
 
-> 💡 **Tip**: For Connection Loops standard messages and subjects, you may also need `cloops.nats.schema`.
+> 💡 **Tip**: Bring in your schema package for message governance. See more details in [schema example](/examples/schema/README.md)
 
 ### Examples
 

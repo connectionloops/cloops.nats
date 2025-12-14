@@ -1,5 +1,6 @@
 using NATS.Client.JetStream;
 using NATS.Client.JetStream.Models;
+using CLOOPS.NATS.Messages;
 
 namespace CLOOPS.NATS;
 
@@ -9,7 +10,7 @@ namespace CLOOPS.NATS;
 /// Ideally should be only be generated from a `SubjectBuilder`
 /// <typeparam name="T">Type of publish payload</typeparam>
 /// </summary>
-public class S_Subject<T>
+public class S_Subject<T> where T : BaseMessage
 {
     /// <summary>
     /// string value of the subject
@@ -22,7 +23,6 @@ public class S_Subject<T>
     /// The subject constructor
     /// </summary>
     /// <param name="cnc">Cloops Nats Client</param>
-    /// <param name="js">JetStream Context</param>
     /// <param name="SubjectName">The string value of the subject</param>
     /// <exception cref="ArgumentException"></exception>
     public S_Subject(ICloopsNatsClient cnc, string SubjectName)
@@ -51,6 +51,7 @@ public class S_Subject<T>
     /// Publishes the message on JetStream Context
     /// Used for durable publishing. Enables you to track the message delivery and ensure success.
     /// Requires the subject to have a stream associated with it
+    /// Validates the message before publishing
     /// Throws on failure
     /// </summary>
     /// <param name="payload"></param>
@@ -63,11 +64,13 @@ public class S_Subject<T>
     ///     <paramref name="dedupeId"/> needs to be set for this to take effect
     /// </param>
     /// <exception cref="ArgumentNullException"></exception>
+    /// <exception cref="System.ComponentModel.DataAnnotations.ValidationException">Thrown when message validation fails.</exception>
     /// <exception cref="NatsJSApiException"></exception>
     /// <exception cref="NatsJSDuplicateMessageException"></exception>
     /// <returns></returns>
     public async Task StreamPublish(T payload, bool ensureSuccess = true, string? dedupeId = null, bool throwOnDuplicate = true)
     {
+        payload.Validate();
         ValueTask<PubAckResponse> ack;
         if (dedupeId != null)
         {

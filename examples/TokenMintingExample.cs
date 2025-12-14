@@ -10,7 +10,7 @@ namespace CLOOPS.NATS.Examples;
 /// </summary>
 public class TokenMintingExample
 {
-    public static async Task RunTokenMintingExample()
+    public static void RunTokenMintingExample()
     {
         Console.WriteLine("Token Minting Example");
         Console.WriteLine("=====================");

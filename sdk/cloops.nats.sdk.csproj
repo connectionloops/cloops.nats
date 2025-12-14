@@ -14,11 +14,11 @@
     <PackageId>cloops.nats</PackageId>
     <Authors>Gaurav Kalele, Atul Soam</Authors>
     <Company>Connection Loops</Company>
-    <PackageDescription>Official SDK to effortlessly use NATS in Connection Loops.</PackageDescription>
+    <PackageDescription>SDK to build NATS consumers with annotations</PackageDescription>
     <PackageTags>sdk;cloops;nats;events;pubsub</PackageTags>
-    <RepositoryUrl>https://dev.azure.com/clvc/MeAtConnectionLoops/_git/cloops.nats</RepositoryUrl>
+    <RepositoryUrl>https://github.com/connectionloops/cloops.nats</RepositoryUrl>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <PackageProjectUrl>https://dev.azure.com/clvc/MeAtConnectionLoops/_git/cloops.nats</PackageProjectUrl>
+    <PackageProjectUrl>https://github.com/connectionloops/cloops.nats</PackageProjectUrl>
     <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
   <ItemGroup>

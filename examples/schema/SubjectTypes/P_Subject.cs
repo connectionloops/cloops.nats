@@ -1,16 +1,14 @@
-using NATS.Client.Core;
-using NATS.Client.JetStream;
-using NATS.Client.JetStream.Models;
+using CLOOPS.NATS.Messages;
 
 namespace CLOOPS.NATS;
 
 /// <summary>
-/// Represents a subject you can send a request to and expect an reply back
-/// Please note: Request-Reply is only applicable in core nats. 
+/// Represents a Subject you can publish an event to
+/// This is core NATS publishing
+/// Ideally should be only be generated from a `SubjectBuilder`
+/// <typeparam name="T">Type of publish payload</typeparam>
 /// </summary>
-/// <typeparam name="Q">Type of request(Question)</typeparam>
-/// <typeparam name="A">Type of reply(Answer)</typeparam>
-public class R_Subject<Q, A>
+public class P_Subject<T> where T : BaseMessage
 {
     /// <summary>
     /// string value of the subject
@@ -25,7 +23,7 @@ public class R_Subject<Q, A>
     /// <param name="cnc">Cloops Nats Client</param>
     /// <param name="SubjectName">The string value of the subjet</param>
     /// <exception cref="ArgumentException"></exception>
-    public R_Subject(ICloopsNatsClient cnc, string SubjectName)
+    public P_Subject(ICloopsNatsClient cnc, string SubjectName)
     {
         if (string.IsNullOrWhiteSpace(SubjectName))
         {
@@ -49,11 +47,14 @@ public class R_Subject<Q, A>
 
     /// <summary>
     /// Publishes an event on the subject using Core NATS
+    /// Validates the message before publishing
     /// </summary>
     /// <param name="payload">Payload to send</param>
     /// <returns>void</returns>
-    public ValueTask<NatsMsg<A>> Request(Q payload)
+    /// <exception cref="System.ComponentModel.DataAnnotations.ValidationException">Thrown when message validation fails.</exception>
+    public ValueTask Publish(T payload)
     {
-        return cnc.RequestAsync<Q, A>(SubjectName, payload);
+        payload.Validate();
+        return cnc.PublishAsync(SubjectName, payload);
     }
 }

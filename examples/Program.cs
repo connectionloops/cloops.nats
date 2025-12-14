@@ -2,6 +2,8 @@
 using System.Diagnostics.CodeAnalysis;
 using System.Linq.Expressions;
 using System.Net;
+using CLOOPS.NATS.Extensions;
+using SequentialGuid;
 
 namespace CLOOPS.NATS.Examples;
 
@@ -55,7 +57,7 @@ public class Program
                     await LockingTestAllCases().ConfigureAwait(false);
                     break;
                 case "minting":
-                    await TokenMintingExample.RunTokenMintingExample().ConfigureAwait(false);
+                    TokenMintingExample.RunTokenMintingExample();
                     break;
                 default:
                     Console.WriteLine($"Unknown example: {args[0]}");
@@ -83,16 +85,14 @@ public class Program
 
         var person = new Person
         {
-            Id = Guid.NewGuid().ToString(),
+            Id = SequentialGuidGenerator.Instance.NewGuid().ToString(),
             Name = "Gaurav Kalele",
             Age = 31,
             Addr = "Santa Clara, CA"
         };
 
-        var sb = new SubjectBuilders.ExampleSubjectBuilder(host.cnc);
-
-        var personSaveSubject = sb.P_SavePerson(person.Id);
-        var personUpdateSubject = sb.S_UpdatePerson(person.Id);
+        var personSaveSubject = host.cnc.Subjects().Example().P_SavePerson(person.Id);
+        var personUpdateSubject = host.cnc.Subjects().Example().S_UpdatePerson(person.Id);
 
         Console.WriteLine($"   Built subject: {personSaveSubject.SubjectName}");
         Console.WriteLine("   Type safety: Can only publish Person events to this subject");
@@ -121,10 +121,17 @@ public class Program
     internal static async Task RequestExample()
     {
         Console.WriteLine("Running Request Example...");
+        var person = new Person
+        {
+            Id = SequentialGuidGenerator.Instance.NewGuid().ToString(),
+            Name = "Gaurav",
+            Age = 31,
+            Addr = "Santa Clara"
+        };
         var sb = new SubjectBuilders.ExampleSubjectBuilder(host.cnc);
-        var resp = await sb.echo().Request("hello");
+        var resp = await sb.echo().Request(person);
         Console.WriteLine($"Received: {resp.Data}");
-        Console.WriteLine("If you saw hello then it worked!");
+        Console.WriteLine("If you saw the same person back then it worked!");
     }
 
     internal static async Task LockingTestAllCases()

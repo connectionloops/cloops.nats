@@ -32,6 +32,6 @@ public class ExampleSubjectBuilder
     public S_Subject<Person> S_UpdatePerson(string id) =>
         new S_Subject<Person>(_client, $"test.persons.{id}.update");
 
-    public R_Subject<string, string> echo() =>
-        new R_Subject<string, string>(_client, "dev.echo");
+    public R_Subject<Person, Person> echo() =>
+        new R_Subject<Person, Person>(_client, "dev.echo");
 }
