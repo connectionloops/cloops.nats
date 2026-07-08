@@ -62,6 +62,8 @@ internal class NatsSubscriptionProcessor
 
     private readonly INatsMetricsService? metricsService;
 
+    private readonly IReadOnlyList<INatsConsumerInterceptor> consumerInterceptors;
+
     /// <summary>
     /// Initializes a new instance of <see cref="NatsSubscriptionProcessor"/> responsible for
     /// invoking a discovered NATS consumer handler method when messages arrive.
@@ -92,6 +94,7 @@ internal class NatsSubscriptionProcessor
         logger = sp.GetRequiredService<ILogger<NatsSubscriptionProcessor>>();
         IsDurable = _IsDurable;
         metricsService = sp.GetService<INatsMetricsService>();
+        consumerInterceptors = sp.GetServices<INatsConsumerInterceptor>().ToArray();
 
         queue = new NatsSubscriptionQueue(int.TryParse(Environment.GetEnvironmentVariable("NATS_SUBSCRIPTION_QUEUE_SIZE"), out int queueSize) ? queueSize : 20000);
         MaxDOP = int.TryParse(Environment.GetEnvironmentVariable("NATS_CONSUMER_MAX_DOP"), out int _maxDop) ? _maxDop : 128;
@@ -363,16 +366,34 @@ internal class NatsSubscriptionProcessor
     /// Note: only one subscription exists per consumer id, so multiple subjects are handled by the same subscription.
     /// This is why we need to use the subject to get the handler and handler class instance.
     /// </summary>
-    private ValueTask EnqueueHandlerInvocationAsync(NatsJSMsg<byte[]> rawMsg, Type payloadType, string subject, CancellationToken ct)
+    private async ValueTask EnqueueHandlerInvocationAsync(NatsJSMsg<byte[]> rawMsg, Type payloadType, string subject, CancellationToken ct)
     {
         handler.TryGetValue(subject, out var _handler);
         var msgObject = BaseNatsUtil.CreateTypedMsgWrapper(rawMsg, payloadType);
+        handlerClassType.TryGetValue(subject, out var _handlerClassType);
         handlerClassInstance.TryGetValue(subject, out var _handlerClassInstance);
+
+        var interception = await ExecuteConsumerInterceptorsAsync(
+            subject,
+            payloadType,
+            _handlerClassType!,
+            _handler!,
+            msgObject,
+            rawMsg.Data,
+            ct).ConfigureAwait(false);
+
+        if (!interception.result.ShouldContinue)
+        {
+            await RejectJetStreamMessageAsync(rawMsg, subject, interception.result, ct).ConfigureAwait(false);
+            return;
+        }
+
+        msgObject = interception.message;
 
         // Validate message payload if it has a Validate() method
         ValidateMessageOrThrow(msgObject, payloadType, subject);
 
-        return queue.QueueBackgroundWorkItem(new WorkItem(subject, async token =>
+        await queue.QueueBackgroundWorkItem(new WorkItem(subject, async token =>
         {
             var result = _handler!.Invoke(_handlerClassInstance, [msgObject, token]);
             var ackTask = (Task<NatsAck>)result!;
@@ -395,20 +416,38 @@ internal class NatsSubscriptionProcessor
                 return (WorkItemExecutionStatus.FAIL, true);
             }
         }
-        ));
+        )).ConfigureAwait(false);
     }
     /// <summary>
     /// Enqueue handler invocation for Core message (no acks, but same Task&lt;NatsAck&gt; contract).
     /// Since this is nats core message, we actually don't need to handle subject -> handler mapping, there is only one subject per consumer, ie.e. each subject and its handler belongs to one consumer no multiplexing
     /// </summary>
-    private ValueTask EnqueueHandlerInvocationAsync(NatsMsg<byte[]> rawMsg, Type payloadType, string subject, MethodInfo _handler, Object _handlerClassInstance, CancellationToken ct)
+    private async ValueTask EnqueueHandlerInvocationAsync(NatsMsg<byte[]> rawMsg, Type payloadType, string subject, MethodInfo _handler, Object _handlerClassInstance, CancellationToken ct)
     {
         var msgObject = BaseNatsUtil.CreateTypedMsgWrapper(rawMsg, payloadType);
+        handlerClassType.TryGetValue(subject, out var _handlerClassType);
+
+        var interception = await ExecuteConsumerInterceptorsAsync(
+            subject,
+            payloadType,
+            _handlerClassType!,
+            _handler,
+            msgObject,
+            rawMsg.Data,
+            ct).ConfigureAwait(false);
+
+        if (!interception.result.ShouldContinue)
+        {
+            await RejectCoreMessageAsync(rawMsg, subject, interception.result, ct).ConfigureAwait(false);
+            return;
+        }
+
+        msgObject = interception.message;
 
         // Validate message payload if it has a Validate() method
         ValidateMessageOrThrow(msgObject, payloadType, subject);
 
-        return queue.QueueBackgroundWorkItem(new WorkItem(subject, async token =>
+        await queue.QueueBackgroundWorkItem(new WorkItem(subject, async token =>
         {
             var result = _handler!.Invoke(_handlerClassInstance, [msgObject, token]);
             var ackTask = (Task<NatsAck>)result!;
@@ -420,7 +459,99 @@ internal class NatsSubscriptionProcessor
 
             return (WorkItemExecutionStatus.SUCCESS, false); // there is no concept of redelivery in core nats. if it reachhes this point. i.e. not throws , then it is a success
         }
-        ));
+        )).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Runs registered consumer interceptors in dependency injection registration order.
+    /// </summary>
+    private async ValueTask<(NatsConsumerInterceptorResult result, object message)> ExecuteConsumerInterceptorsAsync(
+        string subject,
+        Type payloadType,
+        Type handlerType,
+        MethodInfo handlerMethod,
+        object msgObject,
+        byte[]? rawData,
+        CancellationToken ct)
+    {
+        if (consumerInterceptors.Count == 0)
+            return (NatsConsumerInterceptorResult.Continue(), msgObject);
+
+        var context = new NatsConsumerInterceptorContext(subject, payloadType, handlerType, handlerMethod, msgObject, rawData);
+        foreach (var interceptor in consumerInterceptors)
+        {
+            var result = await interceptor.InterceptAsync(context, ct).ConfigureAwait(false);
+            if (result is null)
+            {
+                throw new InvalidOperationException(
+                    $"Consumer interceptor {interceptor.GetType().FullName} returned null for subject {subject}.");
+            }
+
+            if (!result.ShouldContinue)
+                return (result, context.Message);
+        }
+
+        return (NatsConsumerInterceptorResult.Continue(), context.Message);
+    }
+
+    /// <summary>
+    /// Rejects a JetStream message according to the interceptor result.
+    /// </summary>
+    private async Task RejectJetStreamMessageAsync(
+        NatsJSMsg<byte[]> rawMsg,
+        string subject,
+        NatsConsumerInterceptorResult result,
+        CancellationToken ct)
+    {
+        LogRejectedMessage(subject, result);
+
+        // JetStream rejects only affect delivery/ack semantics. Optional Reply is ignored here.
+        if (result.ShouldRetryDelivery)
+        {
+            await rawMsg.NakAsync(cancellationToken: ct).ConfigureAwait(false);
+            return;
+        }
+
+        await rawMsg.AckTerminateAsync(cancellationToken: ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Rejects a Core NATS message according to the interceptor result.
+    /// When the reject includes a reply and the inbound message has a ReplyTo, the reply is sent.
+    /// </summary>
+    private async Task RejectCoreMessageAsync(
+        NatsMsg<byte[]> rawMsg,
+        string subject,
+        NatsConsumerInterceptorResult result,
+        CancellationToken ct)
+    {
+        LogRejectedMessage(subject, result);
+
+        if (result.Reply != null && rawMsg.ReplyTo != null)
+        {
+            await rawMsg.ReplyAsync(result.Reply, cancellationToken: ct).ConfigureAwait(false);
+            return;
+        }
+
+        if (result.Reply != null && rawMsg.ReplyTo == null)
+        {
+            logger.LogWarning(
+                "NATS consumer interceptor rejected subject {Subject} with a reply payload, but the inbound message has no ReplyTo. Reply was not sent.",
+                subject);
+        }
+    }
+
+    /// <summary>
+    /// Logs a message rejected by a consumer interceptor before handler invocation.
+    /// </summary>
+    private void LogRejectedMessage(string subject, NatsConsumerInterceptorResult result)
+    {
+        logger.LogWarning(
+            "NATS consumer interceptor rejected message for subject {Subject}. shouldRetryDelivery={ShouldRetryDelivery} hasReply={HasReply} reason={Reason}",
+            subject,
+            result.ShouldRetryDelivery,
+            result.Reply is not null,
+            result.Reason ?? "");
     }
 
     /// <summary>
