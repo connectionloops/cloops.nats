@@ -94,6 +94,32 @@ public class BaseNatsUtil
             }) ?? throw new InvalidOperationException($"Failed to create NatsMsg<{payloadType.Name}> from JetStream message");
     }
 
+    /// <summary>
+    /// Creates a typed NATS message by preserving metadata from an existing typed wrapper and replacing its payload.
+    /// </summary>
+    /// <param name="originalMsg">The current typed NATS message.</param>
+    /// <param name="payloadType">The payload type expected by the handler.</param>
+    /// <param name="payload">The replacement payload.</param>
+    /// <returns>A typed NATS message instance with the replacement payload.</returns>
+    internal static object CreateTypedMsgWrapper(object originalMsg, Type payloadType, object? payload)
+    {
+        var msgType = typeof(NatsMsg<>).MakeGenericType(payloadType);
+        var originalMsgType = originalMsg.GetType();
+
+        object? GetPropertyValue(string propertyName)
+            => originalMsgType.GetProperty(propertyName)?.GetValue(originalMsg);
+
+        return Activator.CreateInstance(msgType, new object?[] {
+                GetPropertyValue(nameof(NatsMsg<object>.Subject)),
+                GetPropertyValue(nameof(NatsMsg<object>.ReplyTo)),
+                GetPropertyValue(nameof(NatsMsg<object>.Size)),
+                GetPropertyValue(nameof(NatsMsg<object>.Headers)),
+                payload,
+                GetPropertyValue(nameof(NatsMsg<object>.Connection)),
+                GetPropertyValue(nameof(NatsMsg<object>.Flags))
+            }) ?? throw new InvalidOperationException($"Failed to create replacement NatsMsg<{payloadType.Name}>");
+    }
+
     internal static object? Deserialize(byte[]? data, Type payloadType)
     {
         object? payload = null;
