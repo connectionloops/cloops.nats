@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using CLOOPS.NATS.Serialization;
 using NATS.Client.Core;
 using NATS.Client.JetStream;
 
@@ -18,7 +19,12 @@ public class BaseNatsUtil
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
         PropertyNameCaseInsensitive = true,
         NumberHandling = JsonNumberHandling.AllowReadingFromString,
-        Converters = { new JsonStringEnumConverter() },
+        Converters =
+        {
+            new JsonStringEnumConverter(),
+            new Int64StringJsonConverter(),
+            new UInt64StringJsonConverter(),
+        },
     };
 
     /// <summary>
