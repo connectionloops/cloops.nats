@@ -48,7 +48,13 @@ The SDK provides a framework for building reliable, type-safe NATS messaging app
 - **Explicit ACK/NAK contract**: **All handlers** must return `Task<NatsAck>`. JetStream uses the result to `Ack` on `Success` or `Nak` on `Fail`; Core ignores it.
 - **Handler signature enforcement**: The SDK validates at startup that handlers return `Task<NatsAck>`, preventing misconfiguration.
 - **Automatic ACK/NAK (JetStream)**: After handler execution, the processor calls `AckAsync` or `NakAsync` based on the handler’s result, guaranteeing at-least-once delivery.
-- **Exception safety**: If a handler throws, the processor logs the error and issues a NAK (JetStream), enabling retry/DLQ per configuration.
+- **Exception safety**: If a handler throws and no exception handler claims it, the processor logs the error and rethrows with the original stack trace intact. The JetStream message is left unacked, so redelivery follows the consumer's `AckWait` / `MaxDeliver` configuration.
+- **Consumer exception handlers**: Register `INatsConsumerExceptionHandler` implementations via `AddNatsConsumerExceptionHandler<T>()`. When a JetStream or Core handler throws, handlers run in registration order; the first non-null `NatsAck` is applied (ack / nak / terminate / Core reply) instead of faulting the work item. `OperationCanceledException` during shutdown is never converted to an ack.
+- **Mapped exceptions stay observable**: Every mapped exception is logged at `Warning` with the original exception, the failing handler, and the exception handler that claimed it. The resulting `NatsAck` carries `IsExceptionMapped`, `MappedException`, and `MappedByHandlerType`, and the processor records the invocation as `fail` in metrics even when the exception handler chose to ACK. Mapping an exception changes the delivery outcome, never the error rate.
+- **Exception handler isolation**: If an exception handler itself throws, the failure is logged at `Error` and the next registered handler runs. A broken exception handler can never replace or hide the original handler exception.
+- **Testable contexts**: `NatsConsumerInterceptorContext` and `NatsConsumerExceptionContext` expose public constructors, so applications can unit test their own interceptors and exception handlers without a NATS server. The supplied message must be a `NatsMsg<T>` matching the declared payload type.
+- **Delivery context**: Both contexts expose `IsJetStream` and a read-only `JetStream` view (`NumDelivered`, `IsRedelivery`, `NumPending`, stream/consumer sequence, timestamp, stream, consumer, domain), which is `null` for Core NATS. This is observability only — retry budgets and dead-letter routing remain owned by stream/consumer configuration in the control plane, and `MaxDeliver` is not carried on the message.
+- **Unmatched subjects**: If a delivered subject matches no registered handler, the SDK logs an error and leaves the JetStream message unacked so the stream's own `MaxDeliver` / DLQ policy applies. It no longer faults the listener loop.
 
 **Example**:
 
@@ -79,7 +85,8 @@ public async Task<NatsAck> HandleEvent(NatsMsg<Event> msg, CancellationToken ct)
 - **Explicit ACK/NAK contract**: All handlers must return `Task<NatsAck>`.
 
   - `NatsAck.Success` → SDK calls `AckAsync`
-  - `NatsAck.Fail` or exceptions → SDK calls `NakAsync` (JetStream retry behavior applies)
+  - `NatsAck.Fail` → SDK calls `NakAsync` or `AckTerminateAsync` based on `ShouldRetryDelivery`
+  - Unhandled exceptions → SDK leaves the message unacked (JetStream retry behavior applies); registered exception handlers may map the exception to a `NatsAck` instead
 
 - **Retry behavior**: Redelivery timing and limits are controlled by JetStream consumer/stream config (e.g., MaxDeliver, Backoff, DLQ policies).
 

@@ -52,6 +52,9 @@ internal class NatsSubscriptionProcessor
 
     private Dictionary<string, Type> PayloadTypeCache = new();
 
+    // Per-subject compiled invocation plans, built once during Setup.
+    private readonly Dictionary<string, NatsConsumerInvocationPlan> plans = new();
+
     // Cache for Validate() method per payload type to avoid reflection overhead
     private readonly Dictionary<Type, MethodInfo?> ValidateMethodCache = new();
 
@@ -64,6 +67,8 @@ internal class NatsSubscriptionProcessor
 
     private readonly IReadOnlyList<INatsConsumerInterceptor> consumerInterceptors;
 
+    private readonly IReadOnlyList<INatsConsumerExceptionHandler> consumerExceptionHandlers;
+
     /// <summary>
     /// Initializes a new instance of <see cref="NatsSubscriptionProcessor"/> responsible for
     /// invoking a discovered NATS consumer handler method when messages arrive.
@@ -75,6 +80,8 @@ internal class NatsSubscriptionProcessor
     /// <remarks>
     /// The handler method is expected to accept exactly two parameters: a typed message wrapper and a <see cref="CancellationToken"/>.
     /// If the handler returns a <see cref="Task"/>, it is awaited; otherwise it is treated as synchronous.
+    /// Exceptions thrown by handlers are routed to registered <see cref="INatsConsumerExceptionHandler"/> instances
+    /// (if any) so they can return a <see cref="NatsAck"/> instead of faulting the work item.
     /// </remarks>
     internal NatsSubscriptionProcessor(
         IServiceProvider _sp,
@@ -95,6 +102,7 @@ internal class NatsSubscriptionProcessor
         IsDurable = _IsDurable;
         metricsService = sp.GetService<INatsMetricsService>();
         consumerInterceptors = sp.GetServices<INatsConsumerInterceptor>().ToArray();
+        consumerExceptionHandlers = sp.GetServices<INatsConsumerExceptionHandler>().ToArray();
 
         queue = new NatsSubscriptionQueue(int.TryParse(Environment.GetEnvironmentVariable("NATS_SUBSCRIPTION_QUEUE_SIZE"), out int queueSize) ? queueSize : 20000);
         MaxDOP = int.TryParse(Environment.GetEnvironmentVariable("NATS_CONSUMER_MAX_DOP"), out int _maxDop) ? _maxDop : 128;
@@ -148,7 +156,15 @@ internal class NatsSubscriptionProcessor
         foreach (string subject in Subjects)
         {
             // populates cache and performs validations.
-            GetPayloadType(subject);
+            var payloadType = GetPayloadType(subject);
+
+            // Compile the handler invoker once, after the signature has been validated.
+            plans[subject] = new NatsConsumerInvocationPlan(
+                subject,
+                payloadType,
+                handlerClassType[subject],
+                handler[subject],
+                handlerClassInstance[subject]);
         }
 
         // subject matcher
@@ -302,12 +318,19 @@ internal class NatsSubscriptionProcessor
                 var subject = subjectMatcher?.Match(m.Subject);
                 if (subject is null)
                 {
-                    logger.LogError($"Can't match {m.Subject} to a subscribed subject. Your consumer is subscribed to more subjects than you have handlers ");
+                    // Leave the message unacked so JetStream redelivers it and the stream's own
+                    // MaxDeliver / DLQ policy takes over. Terminating here would silently discard
+                    // messages whenever the consumer's filter subjects drift ahead of the handlers.
+                    logger.LogError(
+                        "Can't match {Subject} to a subscribed subject for consumer id {consumerId}. Your consumer is subscribed to more subjects than you have handlers. Leaving the message unacked for redelivery.",
+                        m.Subject, consumerId);
+                    continue;
                 }
-                var payloadType = GetPayloadType(subject!);
+
+                var plan = plans[subject];
                 try
                 {
-                    await EnqueueHandlerInvocationAsync(m, payloadType, subject!, ct).ConfigureAwait(false);
+                    await EnqueueHandlerInvocationAsync(m, plan, ct).ConfigureAwait(false);
                 }
                 catch (MessageValidationException ex)
                 {
@@ -320,12 +343,12 @@ internal class NatsSubscriptionProcessor
                     {
                         logger.LogWarning(ackEx, "Failed to terminate message after validation failure for subject {Subject}", subject);
                     }
-                    logger.LogError(ex, "Message validation failed for subject {Subject} with payload type {PayloadType}. Discarding message.", subject, payloadType.Name);
+                    logger.LogError(ex, "Message validation failed for subject {Subject} with payload type {PayloadType}. Discarding message.", subject, plan.PayloadType.Name);
                 }
                 catch (Exception ex)
                 {
                     logger.LogError(ex, "Can't process message {Subject} with payload type {PayloadType}. Most likely the message is not of type {PayloadType}. Skipping the message {Message}",
-                        subject, payloadType.Name, payloadType.Name, System.Text.Encoding.UTF8.GetString(m.Data ?? Array.Empty<byte>()));
+                        subject, plan.PayloadType.Name, plan.PayloadType.Name, System.Text.Encoding.UTF8.GetString(m.Data ?? Array.Empty<byte>()));
                 }
             }
 
@@ -334,24 +357,22 @@ internal class NatsSubscriptionProcessor
         {
             var coreSubscription = GetCoreSubscription(ct);
             var subject = Subjects.First();
-            handler.TryGetValue(subject, out var _handler);
-            handlerClassInstance.TryGetValue(subject, out var _handlerClassInstance);
+            var plan = plans[subject];
             await foreach (var m in coreSubscription.ConfigureAwait(false))
             {
-                var payloadType = GetPayloadType(subject);
                 try
                 {
-                    await EnqueueHandlerInvocationAsync(m, payloadType, subject, _handler!, _handlerClassInstance!, ct).ConfigureAwait(false);
+                    await EnqueueHandlerInvocationAsync(m, plan, ct).ConfigureAwait(false);
                 }
                 catch (MessageValidationException ex)
                 {
                     // Validation failed - discard the message (no ack needed for core NATS)
-                    logger.LogError(ex, "Message validation failed for subject {Subject} with payload type {PayloadType}. Discarding message.", subject, payloadType.Name);
+                    logger.LogError(ex, "Message validation failed for subject {Subject} with payload type {PayloadType}. Discarding message.", subject, plan.PayloadType.Name);
                 }
                 catch (Exception ex)
                 {
                     logger.LogError(ex, "Can't process message {Subject} | {originalSubject} with payload type {PayloadType}. Most likely the message is not of type {PayloadType}. Skipping the message {Message}",
-                        subject, m.Subject, payloadType.Name, payloadType.Name, System.Text.Encoding.UTF8.GetString(m.Data ?? Array.Empty<byte>()));
+                        subject, m.Subject, plan.PayloadType.Name, plan.PayloadType.Name, System.Text.Encoding.UTF8.GetString(m.Data ?? Array.Empty<byte>()));
                 }
             }
 
@@ -366,44 +387,48 @@ internal class NatsSubscriptionProcessor
     /// Note: only one subscription exists per consumer id, so multiple subjects are handled by the same subscription.
     /// This is why we need to use the subject to get the handler and handler class instance.
     /// </summary>
-    private async ValueTask EnqueueHandlerInvocationAsync(NatsJSMsg<byte[]> rawMsg, Type payloadType, string subject, CancellationToken ct)
+    private async ValueTask EnqueueHandlerInvocationAsync(NatsJSMsg<byte[]> rawMsg, NatsConsumerInvocationPlan plan, CancellationToken ct)
     {
-        handler.TryGetValue(subject, out var _handler);
-        var msgObject = BaseNatsUtil.CreateTypedMsgWrapper(rawMsg, payloadType);
-        handlerClassType.TryGetValue(subject, out var _handlerClassType);
-        handlerClassInstance.TryGetValue(subject, out var _handlerClassInstance);
+        var msgObject = BaseNatsUtil.CreateTypedMsgWrapper(rawMsg, plan.PayloadType);
+        var jetStream = NatsConsumerJetStreamMetadata.From(rawMsg);
 
         var interception = await ExecuteConsumerInterceptorsAsync(
-            subject,
-            payloadType,
-            _handlerClassType!,
-            _handler!,
+            plan,
             msgObject,
             rawMsg.Data,
+            jetStream,
             ct).ConfigureAwait(false);
 
         if (!interception.result.ShouldContinue)
         {
-            await RejectJetStreamMessageAsync(rawMsg, subject, interception.result, ct).ConfigureAwait(false);
+            await RejectJetStreamMessageAsync(rawMsg, plan.MatchedSubject, interception.result, ct).ConfigureAwait(false);
             return;
         }
 
         msgObject = interception.message;
+        var rawData = rawMsg.Data;
 
         // Validate message payload if it has a Validate() method
-        ValidateMessageOrThrow(msgObject, payloadType, subject);
+        ValidateMessageOrThrow(msgObject, plan.PayloadType, plan.MatchedSubject);
 
-        await queue.QueueBackgroundWorkItem(new WorkItem(subject, async token =>
+        await queue.QueueBackgroundWorkItem(new WorkItem(plan.MatchedSubject, async token =>
         {
-            var result = _handler!.Invoke(_handlerClassInstance, [msgObject, token]);
-            var ackTask = (Task<NatsAck>)result!;
-
-            var ackResult = await ackTask.ConfigureAwait(false);
+            var ackResult = await NatsConsumerHandlerInvoker.InvokeAsync(
+                plan,
+                msgObject,
+                rawData,
+                jetStream,
+                consumerExceptionHandlers,
+                logger,
+                token).ConfigureAwait(false);
 
             if (ackResult.IsAcknowledged)
             {
                 await rawMsg.AckAsync(ackResult.Opts, cancellationToken: token).ConfigureAwait(false);
-                return (WorkItemExecutionStatus.SUCCESS, false);
+
+                // An exception handler chose to ack, but the invocation still failed. Apply the ack
+                // it asked for while reporting the failure so error rates stay accurate.
+                return (ackResult.IsExceptionMapped ? WorkItemExecutionStatus.FAIL : WorkItemExecutionStatus.SUCCESS, false);
             }
             else if (!ackResult.ShouldRetryDelivery)
             {
@@ -422,42 +447,47 @@ internal class NatsSubscriptionProcessor
     /// Enqueue handler invocation for Core message (no acks, but same Task&lt;NatsAck&gt; contract).
     /// Since this is nats core message, we actually don't need to handle subject -> handler mapping, there is only one subject per consumer, ie.e. each subject and its handler belongs to one consumer no multiplexing
     /// </summary>
-    private async ValueTask EnqueueHandlerInvocationAsync(NatsMsg<byte[]> rawMsg, Type payloadType, string subject, MethodInfo _handler, Object _handlerClassInstance, CancellationToken ct)
+    private async ValueTask EnqueueHandlerInvocationAsync(NatsMsg<byte[]> rawMsg, NatsConsumerInvocationPlan plan, CancellationToken ct)
     {
-        var msgObject = BaseNatsUtil.CreateTypedMsgWrapper(rawMsg, payloadType);
-        handlerClassType.TryGetValue(subject, out var _handlerClassType);
+        var msgObject = BaseNatsUtil.CreateTypedMsgWrapper(rawMsg, plan.PayloadType);
 
+        // Core NATS carries no JetStream delivery information.
         var interception = await ExecuteConsumerInterceptorsAsync(
-            subject,
-            payloadType,
-            _handlerClassType!,
-            _handler,
+            plan,
             msgObject,
             rawMsg.Data,
+            jetStream: null,
             ct).ConfigureAwait(false);
 
         if (!interception.result.ShouldContinue)
         {
-            await RejectCoreMessageAsync(rawMsg, subject, interception.result, ct).ConfigureAwait(false);
+            await RejectCoreMessageAsync(rawMsg, plan.MatchedSubject, interception.result, ct).ConfigureAwait(false);
             return;
         }
 
         msgObject = interception.message;
+        var rawData = rawMsg.Data;
 
         // Validate message payload if it has a Validate() method
-        ValidateMessageOrThrow(msgObject, payloadType, subject);
+        ValidateMessageOrThrow(msgObject, plan.PayloadType, plan.MatchedSubject);
 
-        await queue.QueueBackgroundWorkItem(new WorkItem(subject, async token =>
+        await queue.QueueBackgroundWorkItem(new WorkItem(plan.MatchedSubject, async token =>
         {
-            var result = _handler!.Invoke(_handlerClassInstance, [msgObject, token]);
-            var ackTask = (Task<NatsAck>)result!;
-
-            var ackResult = await ackTask.ConfigureAwait(false);
+            var ackResult = await NatsConsumerHandlerInvoker.InvokeAsync(
+                plan,
+                msgObject,
+                rawData,
+                jetStream: null,
+                consumerExceptionHandlers,
+                logger,
+                token).ConfigureAwait(false);
 
             if (ackResult.Reply != null && rawMsg.ReplyTo != null)
                 await rawMsg.ReplyAsync(ackResult.Reply, cancellationToken: token).ConfigureAwait(false);
 
-            return (WorkItemExecutionStatus.SUCCESS, false); // there is no concept of redelivery in core nats. if it reachhes this point. i.e. not throws , then it is a success
+            // There is no redelivery in Core NATS, so ack/nak semantics do not apply. The invocation
+            // is a success unless an exception handler produced this ack from a thrown exception.
+            return (ackResult.IsExceptionMapped ? WorkItemExecutionStatus.FAIL : WorkItemExecutionStatus.SUCCESS, false);
         }
         )).ConfigureAwait(false);
     }
@@ -466,25 +496,24 @@ internal class NatsSubscriptionProcessor
     /// Runs registered consumer interceptors in dependency injection registration order.
     /// </summary>
     private async ValueTask<(NatsConsumerInterceptorResult result, object message)> ExecuteConsumerInterceptorsAsync(
-        string subject,
-        Type payloadType,
-        Type handlerType,
-        MethodInfo handlerMethod,
+        NatsConsumerInvocationPlan plan,
         object msgObject,
         byte[]? rawData,
+        NatsConsumerJetStreamMetadata? jetStream,
         CancellationToken ct)
     {
         if (consumerInterceptors.Count == 0)
             return (NatsConsumerInterceptorResult.Continue(), msgObject);
 
-        var context = new NatsConsumerInterceptorContext(subject, payloadType, handlerType, handlerMethod, msgObject, rawData);
+        var context = new NatsConsumerInterceptorContext(
+            plan.MatchedSubject, plan.PayloadType, plan.HandlerType, plan.HandlerMethod, msgObject, rawData, jetStream);
         foreach (var interceptor in consumerInterceptors)
         {
             var result = await interceptor.InterceptAsync(context, ct).ConfigureAwait(false);
             if (result is null)
             {
                 throw new InvalidOperationException(
-                    $"Consumer interceptor {interceptor.GetType().FullName} returned null for subject {subject}.");
+                    $"Consumer interceptor {interceptor.GetType().FullName} returned null for subject {plan.MatchedSubject}.");
             }
 
             if (!result.ShouldContinue)
@@ -559,8 +588,7 @@ internal class NatsSubscriptionProcessor
     /// </summary>
     private async Task ProcessWorkItemAsync(WorkItem workItem, CancellationToken stoppingToken)
     {
-        handler.TryGetValue(workItem.Subject, out var _handler);
-        string fn = _handler!.Name;
+        string fn = plans[workItem.Subject].HandlerName;
         Stopwatch sw = Stopwatch.StartNew();
         string executionStatus = WorkItemExecutionStatus.FAIL; // assume worst
         bool isRetryable = false; // assume worst

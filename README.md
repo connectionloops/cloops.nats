@@ -28,6 +28,8 @@ Modern developers expect annotation-based definitions and dependency injection�
 - 🚀 **JetStream support** - Build temporally decoupled systems with persistent messaging
 - 🔧 **Dependency injection** - Seamless integration with .NET's DI container
 - ✅ **Automatic message validation** - Messages with a `Validate()` method are automatically validated before processing. Invalid messages are never sent to your handlers.
+- 🪝 **Consumer interceptors** - Inspect, replace, or reject messages before handlers run
+- 🧯 **Consumer exception handlers** - Map handler exceptions to a `NatsAck` for consistent JetStream ack/nak and Core request/reply responses, while still logging the original exception and recording the invocation as a failure
 
 > 🎯 **Building microservices?** Check out our [microservices-focused SDK](https://github.com/connectionloops/cloops.microservices) built on top of `cloops.nats` and makes building microservices a breeze!
 

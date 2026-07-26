@@ -89,23 +89,43 @@ public sealed class NatsConsumerInterceptorContext
     /// <param name="payloadType">The handler payload type.</param>
     /// <param name="handlerType">The consumer handler class type.</param>
     /// <param name="handlerMethod">The consumer handler method.</param>
-    /// <param name="message">The typed NATS message that will be passed to the handler.</param>
+    /// <param name="message">The typed NATS message that will be passed to the handler. Must be a <see cref="NatsMsg{T}"/> of <paramref name="payloadType"/>.</param>
     /// <param name="rawData">The original serialized message bytes.</param>
-    internal NatsConsumerInterceptorContext(
+    /// <param name="jetStream">JetStream delivery information, or <c>null</c> for Core NATS messages.</param>
+    /// <exception cref="ArgumentNullException">Thrown when a required argument is null.</exception>
+    /// <exception cref="ArgumentException">Thrown when <paramref name="message"/> is not a <see cref="NatsMsg{T}"/> of <paramref name="payloadType"/>.</exception>
+    /// <remarks>
+    /// The platform builds this context for you. It is public so that you can construct one
+    /// directly in unit tests for your own <see cref="INatsConsumerInterceptor"/> implementations.
+    /// </remarks>
+    public NatsConsumerInterceptorContext(
         string matchedSubject,
         Type payloadType,
         Type handlerType,
         MethodInfo handlerMethod,
         object message,
-        byte[]? rawData)
+        byte[]? rawData,
+        NatsConsumerJetStreamMetadata? jetStream = null)
     {
+        ArgumentNullException.ThrowIfNull(matchedSubject);
+        ArgumentNullException.ThrowIfNull(payloadType);
+        ArgumentNullException.ThrowIfNull(handlerType);
+        ArgumentNullException.ThrowIfNull(handlerMethod);
+        ArgumentNullException.ThrowIfNull(message);
+        NatsMsgAccessor.EnsureTypedMessage(message, payloadType, nameof(message));
+
         MatchedSubject = matchedSubject;
         PayloadType = payloadType;
         HandlerType = handlerType;
         HandlerMethod = handlerMethod;
-        Message = message;
+        currentMessage = message;
         RawData = rawData;
+        JetStream = jetStream;
     }
+
+    private object currentMessage;
+
+    private NatsMsgMetadata? metadata;
 
     /// <summary>
     /// The configured consumer subject that matched the incoming message.
@@ -115,7 +135,7 @@ public sealed class NatsConsumerInterceptorContext
     /// <summary>
     /// The actual incoming message subject.
     /// </summary>
-    public string Subject => GetMessageProperty<string>(nameof(NatsMsg<object>.Subject)) ?? MatchedSubject;
+    public string Subject => Metadata.Subject ?? MatchedSubject;
 
     /// <summary>
     /// The handler payload type.
@@ -135,7 +155,7 @@ public sealed class NatsConsumerInterceptorContext
     /// <summary>
     /// The typed NATS message that will be passed to the handler.
     /// </summary>
-    public object Message { get; private set; }
+    public object Message => currentMessage;
 
     /// <summary>
     /// The original serialized message bytes received from NATS.
@@ -143,14 +163,31 @@ public sealed class NatsConsumerInterceptorContext
     public byte[]? RawData { get; }
 
     /// <summary>
+    /// Read-only JetStream delivery information, or <c>null</c> when the message arrived over Core NATS.
+    /// </summary>
+    public NatsConsumerJetStreamMetadata? JetStream { get; }
+
+    /// <summary>
+    /// Whether this message arrived over JetStream. When <c>false</c>, the transport is Core NATS,
+    /// where <see cref="NatsConsumerInterceptorResult.ShouldRetryDelivery"/> is ignored and
+    /// <see cref="NatsConsumerInterceptorResult.Reply"/> is honoured. When <c>true</c>, the reverse applies.
+    /// </summary>
+    public bool IsJetStream => JetStream.HasValue;
+
+    /// <summary>
     /// The message headers.
     /// </summary>
-    public NatsHeaders? Headers => GetMessageProperty<NatsHeaders>(nameof(NatsMsg<object>.Headers));
+    public NatsHeaders? Headers => Metadata.Headers;
 
     /// <summary>
     /// The reply subject, if this message uses request/reply.
     /// </summary>
-    public string? ReplyTo => GetMessageProperty<string>(nameof(NatsMsg<object>.ReplyTo));
+    public string? ReplyTo => Metadata.ReplyTo;
+
+    /// <summary>
+    /// Transport metadata for the current message, re-read only after an interceptor replaces it.
+    /// </summary>
+    private NatsMsgMetadata Metadata => metadata ??= NatsMsgAccessor.Read(currentMessage);
 
     /// <summary>
     /// Gets the current message as a typed <see cref="NatsMsg{T}"/>.
@@ -176,7 +213,7 @@ public sealed class NatsConsumerInterceptorContext
     public void ReplaceMessage<TPayload>(NatsMsg<TPayload> message)
     {
         EnsurePayloadType<TPayload>();
-        Message = message;
+        SetMessage(message);
     }
 
     /// <summary>
@@ -190,7 +227,16 @@ public sealed class NatsConsumerInterceptorContext
         EnsurePayloadType<TPayload>();
 
         // Rebuild the immutable NatsMsg<T> wrapper so downstream handlers see the modified payload.
-        Message = BaseNatsUtil.CreateTypedMsgWrapper(Message, PayloadType, payload);
+        SetMessage(BaseNatsUtil.CreateTypedMsgWrapper(currentMessage, PayloadType, payload));
+    }
+
+    /// <summary>
+    /// Swaps the current message and drops the cached metadata read from the previous one.
+    /// </summary>
+    private void SetMessage(object replacement)
+    {
+        currentMessage = replacement;
+        metadata = null;
     }
 
     private void EnsurePayloadType<TPayload>()
@@ -200,15 +246,6 @@ public sealed class NatsConsumerInterceptorContext
             throw new InvalidOperationException(
                 $"Interceptor replacement type {typeof(TPayload).Name} does not match handler payload type {PayloadType.Name}.");
         }
-    }
-
-    private T? GetMessageProperty<T>(string propertyName)
-    {
-        var property = Message.GetType().GetProperty(propertyName);
-        if (property?.GetValue(Message) is T value)
-            return value;
-
-        return default;
     }
 }
 

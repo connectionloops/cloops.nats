@@ -55,20 +55,16 @@ public class BaseNatsUtil
     /// <returns>Typed NATS message instance</returns>
     internal static object CreateTypedMsgWrapper(NatsMsg<byte[]> originalMsg, Type payloadType)
     {
-        // Create NatsMsg<T> using the most basic approach that works
-        // Use dynamic to avoid reflection constructor issues
-        var msgType = typeof(NatsMsg<>).MakeGenericType(payloadType);
         var payload = Deserialize(originalMsg.Data, payloadType);
 
-        return Activator.CreateInstance(msgType, new object?[] {
-                originalMsg.Subject,        // subject
-                originalMsg.ReplyTo,        // replyTo
-                originalMsg.Size,           // size
-                originalMsg.Headers,        // headers
-                payload,                    // data (T)
-                originalMsg.Connection,     // connection
-                originalMsg.Flags           // flags
-            }) ?? throw new InvalidOperationException($"Failed to create NatsMsg<{payloadType.Name}>");
+        return NatsMsgAccessor.GetFactory(payloadType)(
+            originalMsg.Subject,
+            originalMsg.ReplyTo,
+            originalMsg.Size,
+            originalMsg.Headers,
+            payload,
+            originalMsg.Connection,
+            originalMsg.Flags);
     }
 
     /// <summary>
@@ -79,19 +75,16 @@ public class BaseNatsUtil
     /// <returns>Typed NATS message instance</returns>
     internal static object CreateTypedMsgWrapper(NatsJSMsg<byte[]> originalMsg, Type payloadType)
     {
-        // Create NatsMsg<T> from JetStream message
-        var msgType = typeof(NatsMsg<>).MakeGenericType(payloadType);
         var payload = Deserialize(originalMsg.Data, payloadType);
 
-        return Activator.CreateInstance(msgType, new object?[] {
-                originalMsg.Subject,        // subject
-                originalMsg.ReplyTo,        // replyTo
-                originalMsg.Size,           // size
-                originalMsg.Headers,        // headers
-                payload,                    // data (T)
-                originalMsg.Connection,     // connection
-                default(NatsMsgFlags)       // flags - JetStream doesn't have this
-            }) ?? throw new InvalidOperationException($"Failed to create NatsMsg<{payloadType.Name}> from JetStream message");
+        return NatsMsgAccessor.GetFactory(payloadType)(
+            originalMsg.Subject,
+            originalMsg.ReplyTo,
+            originalMsg.Size,
+            originalMsg.Headers,
+            payload,
+            originalMsg.Connection,
+            default);  // flags - JetStream doesn't have this
     }
 
     /// <summary>
@@ -103,21 +96,16 @@ public class BaseNatsUtil
     /// <returns>A typed NATS message instance with the replacement payload.</returns>
     internal static object CreateTypedMsgWrapper(object originalMsg, Type payloadType, object? payload)
     {
-        var msgType = typeof(NatsMsg<>).MakeGenericType(payloadType);
-        var originalMsgType = originalMsg.GetType();
+        var metadata = NatsMsgAccessor.Read(originalMsg);
 
-        object? GetPropertyValue(string propertyName)
-            => originalMsgType.GetProperty(propertyName)?.GetValue(originalMsg);
-
-        return Activator.CreateInstance(msgType, new object?[] {
-                GetPropertyValue(nameof(NatsMsg<object>.Subject)),
-                GetPropertyValue(nameof(NatsMsg<object>.ReplyTo)),
-                GetPropertyValue(nameof(NatsMsg<object>.Size)),
-                GetPropertyValue(nameof(NatsMsg<object>.Headers)),
-                payload,
-                GetPropertyValue(nameof(NatsMsg<object>.Connection)),
-                GetPropertyValue(nameof(NatsMsg<object>.Flags))
-            }) ?? throw new InvalidOperationException($"Failed to create replacement NatsMsg<{payloadType.Name}>");
+        return NatsMsgAccessor.GetFactory(payloadType)(
+            metadata.Subject,
+            metadata.ReplyTo,
+            metadata.Size,
+            metadata.Headers,
+            payload,
+            metadata.Connection,
+            metadata.Flags);
     }
 
     internal static object? Deserialize(byte[]? data, Type payloadType)
