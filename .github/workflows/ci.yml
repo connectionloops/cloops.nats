@@ -39,8 +39,7 @@ jobs:
         run: dotnet build ${{ env.PROJECT }} --configuration ${{ env.BUILD_CONFIGURATION }} --no-restore -p:Version=${{ steps.version.outputs.PACKAGE_VERSION }}
 
       - name: Run tests
-        run: dotnet test **/*Tests/*.csproj --configuration ${{ env.BUILD_CONFIGURATION }} --no-build --verbosity normal
-        continue-on-error: true
+        run: dotnet test tests/cloops.nats.sdk.Tests/cloops.nats.sdk.Tests.csproj --configuration ${{ env.BUILD_CONFIGURATION }} --verbosity normal
 
       - name: Upload test results
         if: always()
