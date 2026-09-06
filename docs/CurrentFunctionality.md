@@ -170,11 +170,16 @@ when the caller owns the lifecycle.
 would stall **all** consumers - including attribute declared ones - while the pod still reports healthy and
 ready. Each source therefore gets a budget of **30 seconds**
 (`NATS_DYNAMIC_CONSUMER_DISCOVERY_TIMEOUT_SECONDS`, `0` disables it). On expiry the SDK logs `Critical` and
-throws `TimeoutException` - a crash-loop is visible, a silently idle pod is not.
+throws `TimeoutException` - a crash-loop is visible, a silently idle pod is not. The budget is raced against
+the call rather than merely signalled through the cancellation token, so it bounds a source that ignores its
+token too; honour the token anyway, since an abandoned discovery task keeps running until the process exits.
 
 **Limits**:
 
 - A subject can only be bound once per process. Two lanes must have distinct subject filters.
+- Queue groups are core-subscription only. Passing one together with a consumer id throws: the attribute
+  discards it on the durable branch and the processor only reads it on the core path, so honouring it is
+  impossible and silently accepting it would mislead.
 - Registration happens once, when consumers are mapped. Lane membership changes are picked up on the next
   restart - which is what the control-plane lane-split runbook expects.
 - Durable consumers must already exist; the SDK attaches, it never creates.

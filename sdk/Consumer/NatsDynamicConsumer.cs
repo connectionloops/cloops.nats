@@ -50,10 +50,12 @@ public sealed class NatsDynamicConsumer
     public string? ConsumerId { get; }
 
     /// <summary>
-    /// NATS queue group name. Only meaningful for core subscriptions.
+    /// NATS queue group name. Core subscriptions only - durable consumers distribute work through the
+    /// JetStream consumer itself, so supplying one alongside a consumer id is rejected rather than ignored.
     /// Supports the same placeholders as <see cref="NatsConsumerAttribute.QueueGroupName"/>.
     /// </summary>
-    public string QueueGroupName { get; }
+    /// <remarks>Reads through to the attribute, so the two can never disagree.</remarks>
+    public string QueueGroupName => Attribute.QueueGroupName;
 
     /// <summary>
     /// The class declaring the handler. Resolved from DI when the consumer is registered.
@@ -88,9 +90,9 @@ public sealed class NatsDynamicConsumer
     /// <param name="handlerType">Class declaring <paramref name="handlerMethod"/>. Must be resolvable from DI.</param>
     /// <param name="handlerMethod">Handler method. Must be <c>Task&lt;NatsAck&gt; M(NatsMsg&lt;T&gt;, CancellationToken)</c>.</param>
     /// <param name="consumerId">Durable JetStream consumer id. Omit for a core NATS subscription.</param>
-    /// <param name="queueGroupName">Queue group name, core subscriptions only.</param>
+    /// <param name="queueGroupName">Queue group name. Core subscriptions only; must be empty when <paramref name="consumerId"/> is supplied.</param>
     /// <exception cref="ArgumentNullException">A required argument is null.</exception>
-    /// <exception cref="ArgumentException">The subject / consumer id is blank, or the method does not belong to <paramref name="handlerType"/>.</exception>
+    /// <exception cref="ArgumentException">The subject / consumer id is blank, a queue group was supplied for a durable consumer, or the method does not belong to <paramref name="handlerType"/>.</exception>
     /// <exception cref="InvalidOperationException">The handler signature does not match the consumer contract.</exception>
     public NatsDynamicConsumer(
         string subject,
@@ -110,6 +112,16 @@ public sealed class NatsDynamicConsumer
         if (consumerId is not null && string.IsNullOrWhiteSpace(consumerId))
         {
             throw new ArgumentException("Dynamic consumer id must not be blank. Pass null for a core NATS subscription.", nameof(consumerId));
+        }
+
+        // NatsConsumerAttribute drops the queue group on the durable branch, and the processor only reads it
+        // on the core subscription path - so for a durable it is doubly dead. Refuse it instead of accepting
+        // a value that will never be honoured.
+        if (consumerId is not null && !string.IsNullOrEmpty(queueGroupName))
+        {
+            throw new ArgumentException(
+                $"Queue group '{queueGroupName}' cannot be used with durable consumer id '{consumerId}'. Queue groups apply to core NATS subscriptions only; a durable consumer distributes work through the JetStream consumer itself.",
+                nameof(queueGroupName));
         }
 
         var declaringType = handlerMethod.DeclaringType;
@@ -132,10 +144,9 @@ public sealed class NatsDynamicConsumer
 
         Subject = subject;
         ConsumerId = consumerId;
-        QueueGroupName = queueGroupName ?? "";
         HandlerType = handlerType;
         HandlerMethod = handlerMethod;
-        Attribute = new NatsConsumerAttribute(subject, consumerId, QueueGroupName);
+        Attribute = new NatsConsumerAttribute(subject, consumerId, queueGroupName ?? "");
     }
 }
 

@@ -77,19 +77,42 @@ public interface ICloopsNatsClient : INatsClient
     /// anything the registered <see cref="INatsDynamicConsumerSource"/> implementations return.
     /// </param>
     /// <remarks>
+    /// <para>
     /// This is a separate overload rather than an optional parameter on the four argument method on purpose:
     /// C# binds optional arguments at the call site, so adding one would remove the four argument member
     /// reference and break already-compiled callers at runtime.
     /// Most applications should register an <see cref="INatsDynamicConsumerSource"/> instead of calling this;
     /// it is here for callers that own the consumer lifecycle themselves.
+    /// </para>
+    /// <para>
+    /// <b>Implementers:</b> the default implementation below cannot register runtime consumers, so it refuses
+    /// as soon as there are any - whether passed in <paramref name="dynamicConsumers"/> or registered in
+    /// <paramref name="sp"/> as an <see cref="INatsDynamicConsumerSource"/>. If you implement
+    /// <see cref="ICloopsNatsClient"/> yourself and want runtime consumers to work, override <b>this</b>
+    /// overload and honour both. Note the SDK cannot police the four argument overload for you: calling it
+    /// directly on a custom implementation runs none of this code, so query
+    /// <see cref="INatsDynamicConsumerSource"/> there too.
+    /// </para>
     /// </remarks>
     public Task MapConsumers(IServiceProvider sp, CancellationToken ct, string[]? assemblyNameFilters, bool throwOnDuplicate, IEnumerable<NatsDynamicConsumer>? dynamicConsumers)
+    {
         // Default implementation so existing ICloopsNatsClient implementations keep compiling. It cannot
-        // honour dynamicConsumers, so it refuses loudly rather than silently dropping them.
-        => dynamicConsumers is null || !dynamicConsumers.Any()
-            ? MapConsumers(sp, ct, assemblyNameFilters, throwOnDuplicate)
-            : throw new NotSupportedException(
-                $"{GetType().FullName} does not implement dynamic NATS consumer registration. Use CloopsNatsClient, or override this overload.");
+        // honour runtime consumers, so it refuses loudly rather than silently dropping them. Registered
+        // sources count: they are the documented way to supply consumers, so ignoring them here would
+        // reintroduce exactly the silent drop this guard exists to prevent.
+        var hasExplicitConsumers = dynamicConsumers is not null && dynamicConsumers.Any();
+        var hasRegisteredSources = sp.GetServices<INatsDynamicConsumerSource>().Any();
+
+        if (hasExplicitConsumers || hasRegisteredSources)
+        {
+            throw new NotSupportedException(
+                $"{GetType().FullName} does not implement dynamic NATS consumer registration, but " +
+                (hasExplicitConsumers ? "consumers were supplied" : $"an {nameof(INatsDynamicConsumerSource)} is registered") +
+                ". Use CloopsNatsClient, or override this overload.");
+        }
+
+        return MapConsumers(sp, ct, assemblyNameFilters, throwOnDuplicate);
+    }
 
     /// <summary>
     /// Sets Up All the KV Stores
@@ -444,30 +467,51 @@ public class CloopsNatsClient : ICloopsNatsClient
         {
             var sourceName = source.GetType().FullName ?? source.GetType().Name;
 
-            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            using var discoveryCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             if (timeout != Timeout.InfiniteTimeSpan)
             {
-                timeoutCts.CancelAfter(timeout);
+                // Ask the source to stop cooperatively...
+                discoveryCts.CancelAfter(timeout);
+            }
+
+            var discovery = InvokeSourceAsync(source, discoveryCts.Token);
+
+            if (timeout != Timeout.InfiniteTimeSpan)
+            {
+                // ...but do not depend on it obeying. Racing the call against the budget is what
+                // actually bounds a source that ignores the token it was handed.
+                using var budgetCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                var budget = Task.Delay(timeout, budgetCts.Token);
+                var finished = await Task.WhenAny(discovery, budget).ConfigureAwait(false);
+
+                if (!ReferenceEquals(finished, discovery))
+                {
+                    // The host is shutting down; that is a cancellation, not a discovery timeout.
+                    ct.ThrowIfCancellationRequested();
+
+                    // A running Task cannot be stopped. Abandon it, but observe any later fault so it
+                    // does not resurface as an unobserved task exception.
+                    Forget(discovery);
+
+                    logger?.LogCritical("Dynamic consumer source {Source} did not return within {DiscoveryTimeout} and did not honour its cancellation token; no NATS consumers were started", sourceName, timeout);
+                    throw new TimeoutException(
+                        $"Dynamic consumer source {sourceName} did not return within {timeout} and did not honour its cancellation token. Consumer startup is blocked until every source completes; keep discovery bounded or raise NATS_DYNAMIC_CONSUMER_DISCOVERY_TIMEOUT_SECONDS.");
+                }
+
+                budgetCts.Cancel(); // release the timer
             }
 
             IReadOnlyCollection<NatsDynamicConsumer>? fromSource;
             try
             {
-                fromSource = await source.GetConsumersAsync(timeoutCts.Token).ConfigureAwait(false);
+                fromSource = await discovery.ConfigureAwait(false);
             }
-            catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !ct.IsCancellationRequested)
+            catch (OperationCanceledException) when (discoveryCts.IsCancellationRequested && !ct.IsCancellationRequested)
             {
+                // The cooperative case: the source honoured the token and bailed out.
                 logger?.LogCritical("Dynamic consumer source {Source} did not return within {DiscoveryTimeout}; no NATS consumers were started", sourceName, timeout);
                 throw new TimeoutException(
                     $"Dynamic consumer source {sourceName} did not return within {timeout}. Consumer startup is blocked until every source completes; keep discovery bounded or raise NATS_DYNAMIC_CONSUMER_DISCOVERY_TIMEOUT_SECONDS.");
-            }
-
-            // A source that ignores its cancellation token still gets caught here.
-            if (timeoutCts.IsCancellationRequested && !ct.IsCancellationRequested)
-            {
-                logger?.LogCritical("Dynamic consumer source {Source} exceeded {DiscoveryTimeout} and ignored its cancellation token; no NATS consumers were started", sourceName, timeout);
-                throw new TimeoutException(
-                    $"Dynamic consumer source {sourceName} exceeded {timeout} and did not honour its cancellation token. Consumer startup is blocked until every source completes; keep discovery bounded or raise NATS_DYNAMIC_CONSUMER_DISCOVERY_TIMEOUT_SECONDS.");
             }
 
             if (fromSource == null)
@@ -481,6 +525,23 @@ public class CloopsNatsClient : ICloopsNatsClient
         }
 
         return resolved;
+
+        // Calls the source, turning a synchronous throw into a faulted task so every failure is
+        // observed through the same await.
+        static Task<IReadOnlyCollection<NatsDynamicConsumer>> InvokeSourceAsync(INatsDynamicConsumerSource source, CancellationToken ct)
+        {
+            try
+            {
+                return source.GetConsumersAsync(ct).AsTask();
+            }
+            catch (Exception ex)
+            {
+                return Task.FromException<IReadOnlyCollection<NatsDynamicConsumer>>(ex);
+            }
+        }
+
+        static void Forget(Task task) =>
+            _ = task.ContinueWith(static t => _ = t.Exception, CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
 
         static void AddAll(List<NatsDynamicConsumer> target, IEnumerable<NatsDynamicConsumer> items, string origin)
         {

@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Reflection;
 using System.Reflection.Emit;
 using CLOOPS.NATS;
@@ -19,6 +20,9 @@ public class NatsDynamicConsumerTests
 {
     // A filter that matches no loaded assembly, so only runtime supplied consumers are registered.
     private static readonly string[] NoAssemblies = ["__no_assembly_matches_this__"];
+
+    // Generous ceiling for a 1s discovery budget: proves the budget was enforced without being flaky on CI.
+    private static readonly TimeSpan BudgetCeiling = TimeSpan.FromSeconds(15);
 
     #region validation
 
@@ -86,6 +90,29 @@ public class NatsDynamicConsumerTests
     {
         Assert.Throws<ArgumentException>(() =>
             new NatsDynamicConsumer("cbb.lane.1", typeof(LaneConsumer), MethodOf(nameof(LaneConsumer.Handle)), "  "));
+    }
+
+    [Fact]
+    public void Ctor_Throws_WhenAQueueGroupIsCombinedWithADurableConsumerId()
+    {
+        // NatsConsumerAttribute drops the queue group on the durable branch and the processor only reads it
+        // on the core path, so accepting one here would silently ignore it.
+        var ex = Assert.Throws<ArgumentException>(() =>
+            new NatsDynamicConsumer("cbb.lane.1", typeof(LaneConsumer), MethodOf(nameof(LaneConsumer.Handle)), "cbb-lane-1", "lanes"));
+
+        Assert.Contains("core NATS subscriptions only", ex.Message);
+    }
+
+    [Fact]
+    public void QueueGroupName_MatchesTheAttribute()
+    {
+        var core = new NatsDynamicConsumer("cbb.probe", typeof(LaneConsumer), MethodOf(nameof(LaneConsumer.Handle)), queueGroupName: "probes");
+        Assert.Equal("probes", core.QueueGroupName);
+        Assert.Equal(core.Attribute.QueueGroupName, core.QueueGroupName);
+
+        var durable = NewConsumer("cbb.lane.9.>", "cbb-lane-9");
+        Assert.Equal("", durable.QueueGroupName);
+        Assert.Equal(durable.Attribute.QueueGroupName, durable.QueueGroupName);
     }
 
     #endregion validation
@@ -420,30 +447,60 @@ public class NatsDynamicConsumerTests
     #region discovery timeout
 
     [Fact]
-    public async Task BuildSubscriptionProcessors_Throws_WhenSourceExceedsDiscoveryTimeout()
+    public async Task BuildSubscriptionProcessors_Throws_WhenCooperativeSourceExceedsDiscoveryTimeout()
     {
         using var _ = new EnvVar("NATS_DYNAMIC_CONSUMER_DISCOVERY_TIMEOUT_SECONDS", "1");
         await using var client = NewClient();
         using var sp = NewServiceProvider(services => services.AddNatsDynamicConsumerSource<HangingSource>());
 
+        var elapsed = Stopwatch.StartNew();
         var ex = await Assert.ThrowsAsync<TimeoutException>(() =>
             client.BuildSubscriptionProcessors(sp, NoAssemblies, throwOnDuplicate: true, dynamicConsumers: null, CancellationToken.None));
+        elapsed.Stop();
 
         Assert.Contains(nameof(HangingSource), ex.Message);
         Assert.Contains("NATS_DYNAMIC_CONSUMER_DISCOVERY_TIMEOUT_SECONDS", ex.Message);
+        Assert.True(elapsed.Elapsed < BudgetCeiling, $"discovery took {elapsed.Elapsed}, expected the 1s budget to be enforced");
     }
 
     [Fact]
     public async Task BuildSubscriptionProcessors_Throws_WhenSourceIgnoresItsCancellationToken()
     {
+        // TokenIgnoringSource NEVER returns. If the budget is not raced against the call - if the SDK just
+        // awaits it and inspects the token afterwards - this test hangs forever instead of failing, which is
+        // exactly how the first version of this timeout slipped through.
         using var _ = new EnvVar("NATS_DYNAMIC_CONSUMER_DISCOVERY_TIMEOUT_SECONDS", "1");
         await using var client = NewClient();
         using var sp = NewServiceProvider(services => services.AddNatsDynamicConsumerSource<TokenIgnoringSource>());
 
+        var elapsed = Stopwatch.StartNew();
         var ex = await Assert.ThrowsAsync<TimeoutException>(() =>
             client.BuildSubscriptionProcessors(sp, NoAssemblies, throwOnDuplicate: true, dynamicConsumers: null, CancellationToken.None));
+        elapsed.Stop();
 
+        Assert.Contains(nameof(TokenIgnoringSource), ex.Message);
         Assert.Contains("did not honour its cancellation token", ex.Message);
+        Assert.True(elapsed.Elapsed < BudgetCeiling, $"discovery took {elapsed.Elapsed}, expected the 1s budget to be enforced despite the source ignoring its token");
+    }
+
+    [Fact]
+    public async Task BuildSubscriptionProcessors_BoundsEverySource_NotJustTheFirst()
+    {
+        // A cooperative source ahead of a token-ignoring one must not consume the second one's budget.
+        using var _ = new EnvVar("NATS_DYNAMIC_CONSUMER_DISCOVERY_TIMEOUT_SECONDS", "1");
+        await using var client = NewClient();
+        using var sp = NewServiceProvider(services =>
+        {
+            services.AddNatsDynamicConsumerSource<LaneSource>();
+            services.AddNatsDynamicConsumerSource<TokenIgnoringSource>();
+        });
+
+        var elapsed = Stopwatch.StartNew();
+        await Assert.ThrowsAsync<TimeoutException>(() =>
+            client.BuildSubscriptionProcessors(sp, NoAssemblies, throwOnDuplicate: true, dynamicConsumers: null, CancellationToken.None));
+        elapsed.Stop();
+
+        Assert.True(elapsed.Elapsed < BudgetCeiling, $"discovery took {elapsed.Elapsed}");
     }
 
     [Fact]
@@ -452,7 +509,7 @@ public class NatsDynamicConsumerTests
         // A cancelled host shutdown must not be misreported as a discovery timeout.
         using var _ = new EnvVar("NATS_DYNAMIC_CONSUMER_DISCOVERY_TIMEOUT_SECONDS", "600");
         await using var client = NewClient();
-        using var sp = NewServiceProvider(services => services.AddNatsDynamicConsumerSource<HangingSource>());
+        using var sp = NewServiceProvider(services => services.AddNatsDynamicConsumerSource<TokenIgnoringSource>());
         using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(250));
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
@@ -670,12 +727,15 @@ public class NatsDynamicConsumerTests
         }
     }
 
-    /// <summary>A source that overruns its budget and ignores the cancellation token it was given.</summary>
+    /// <summary>
+    /// A source that never returns AND ignores the cancellation token it was given - the hazard the
+    /// discovery budget exists to bound. It must never be awaited to completion.
+    /// </summary>
     public class TokenIgnoringSource : INatsDynamicConsumerSource
     {
         public async ValueTask<IReadOnlyCollection<NatsDynamicConsumer>> GetConsumersAsync(CancellationToken ct = default)
         {
-            await Task.Delay(TimeSpan.FromSeconds(2), CancellationToken.None);
+            await Task.Delay(Timeout.Infinite, CancellationToken.None);
             return [];
         }
     }
