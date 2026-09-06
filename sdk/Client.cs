@@ -59,8 +59,20 @@ public interface ICloopsNatsClient : INatsClient
     /// <param name="assemblyNameFilters">Optional assembly simple name filters (exact or prefix, case-insensitive). If omitted / empty, scans all loaded assemblies.</param>
     /// <param name="throwOnDuplicate">If true, the process fails fast if a duplicate consumer subject is found. If false, the duplicate is not reported here (see remarks).</param>
     /// <remarks>
-    /// Any <see cref="INatsDynamicConsumerSource"/> registered in <paramref name="sp"/> is queried as well,
-    /// so runtime consumer registration needs no change at this call site.
+    /// <para>
+    /// <see cref="CloopsNatsClient"/> forwards this to the five argument overload, so any
+    /// <see cref="INatsDynamicConsumerSource"/> registered in <paramref name="sp"/> is queried as well and
+    /// runtime consumer registration needs no change at this call site. That is behaviour of the SDK's own
+    /// client, not a guarantee of this interface - see below.
+    /// </para>
+    /// <para>
+    /// <b>Implementers:</b> this is the member callers reach for, and the SDK cannot police it for you.
+    /// A call that lands here runs none of the SDK's code, so if you implement
+    /// <see cref="ICloopsNatsClient"/> yourself you must query <see cref="INatsDynamicConsumerSource"/> from
+    /// <paramref name="sp"/> in <b>this</b> method - the default implementation of the five argument
+    /// overload cannot do it for you. Forwarding here to that overload, as
+    /// <see cref="CloopsNatsClient"/> does, is the simplest way to stay correct.
+    /// </para>
     /// </remarks>
     public Task MapConsumers(IServiceProvider sp, CancellationToken ct = default, string[]? assemblyNameFilters = null, bool throwOnDuplicate = true);
 
@@ -89,9 +101,8 @@ public interface ICloopsNatsClient : INatsClient
     /// as soon as there are any - whether passed in <paramref name="dynamicConsumers"/> or registered in
     /// <paramref name="sp"/> as an <see cref="INatsDynamicConsumerSource"/>. If you implement
     /// <see cref="ICloopsNatsClient"/> yourself and want runtime consumers to work, override <b>this</b>
-    /// overload and honour both. Note the SDK cannot police the four argument overload for you: calling it
-    /// directly on a custom implementation runs none of this code, so query
-    /// <see cref="INatsDynamicConsumerSource"/> there too.
+    /// overload and honour both, then forward the four argument overload to it - the caveat on that member
+    /// explains why doing so is on you rather than on the SDK.
     /// </para>
     /// </remarks>
     public Task MapConsumers(IServiceProvider sp, CancellationToken ct, string[]? assemblyNameFilters, bool throwOnDuplicate, IEnumerable<NatsDynamicConsumer>? dynamicConsumers)

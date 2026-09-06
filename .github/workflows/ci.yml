@@ -15,6 +15,8 @@ jobs:
   build:
     name: Build and Test
     runs-on: ubuntu-latest
+    # A hung consumer-discovery test would otherwise burn the 6h default job limit instead of going red.
+    timeout-minutes: 15
 
     steps:
       - name: Checkout code
