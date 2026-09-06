@@ -10,6 +10,7 @@ Quick navigation to key features:
 - [Available Features](#️-available-features)
   - [Message Subscription & Consumption](#-message-subscription--consumption)
   - [JetStream Durable Consumers](#-jetstream-durable-consumers)
+  - [Runtime (Dynamic) Consumer Registration](#-runtime-dynamic-consumer-registration)
   - [High-Performance Processing](#-high-performance-processing)
   - [Distributed Locking](#-distributed-locking)
   - [Queue Groups Implementation](#-queue-groups-implementation)
@@ -107,6 +108,71 @@ public async Task<NatsAck> ProcessDurableEffect(NatsMsg<EffectTriggered> msg, Ca
     }
 }
 ```
+
+### 🧩 Runtime (Dynamic) Consumer Registration
+
+**Purpose**: Bind consumers whose subjects / durable consumer ids are only known at runtime.
+
+`[NatsConsumer]` is not `AllowMultiple` and its values are compile-time constants, so it cannot express
+_"one handler, N durable consumers"_. When the set of durables is owned by the control plane and changes
+over time (for example a stream that is re-sharded into lanes), the service can discover them at startup
+and register them itself.
+
+**Key Features**:
+
+- **Same code path**: dynamic consumers are validated, multiplexed per consumer id, intercepted, metered
+  and acked exactly like attribute declared ones. Nothing about the runtime behaviour differs.
+- **Fails loudly**: `NatsDynamicConsumer` validates the handler contract
+  (`Task<NatsAck> H(NatsMsg<T> msg, CancellationToken ct = default)`) in its constructor, so a bad binding
+  throws where you create it instead of at subscribe time.
+- **Async discovery**: `INatsDynamicConsumerSource.GetConsumersAsync` is awaited, so a source can query
+  JetStream for the durables that currently exist before deciding what to bind.
+- **Opt-in**: with no source registered and no argument passed, discovery is unchanged.
+
+**Registration (preferred)** — register a source before the host starts; it is resolved and awaited once,
+when consumers are mapped:
+
+```csharp
+// Program.cs, before RunAsync()
+app.builder.Services.AddSingleton<LaneConsumer>();
+app.builder.Services.AddNatsDynamicConsumerSource<LaneDiscoverySource>();
+```
+
+```csharp
+public class LaneDiscoverySource(ICloopsNatsClient nats) : INatsDynamicConsumerSource
+{
+    public async ValueTask<IReadOnlyCollection<NatsDynamicConsumer>> GetConsumersAsync(CancellationToken ct = default)
+    {
+        var handler = typeof(LaneConsumer).GetMethod(nameof(LaneConsumer.Handle))!;
+        var consumers = new List<NatsDynamicConsumer>();
+
+        // durables are created in the control plane; discover the ones that exist right now
+        await foreach (var name in nats.JsContext.ListConsumerNamesAsync("CBB_WORK", ct))
+        {
+            if (!name.StartsWith("cbb-lane-", StringComparison.Ordinal)) continue;
+            consumers.Add(new NatsDynamicConsumer(
+                subject: $"cbb.work.{name["cbb-lane-".Length..]}.>",
+                handlerType: typeof(LaneConsumer),
+                handlerMethod: handler,
+                consumerId: name));
+        }
+
+        return consumers;
+    }
+}
+```
+
+The handler class is resolved from DI (`GetRequiredService`), so it must be registered like any other
+consumer class. Consumers can also be passed straight to `MapConsumers(..., dynamicConsumers: [...])`
+when the caller owns the lifecycle.
+
+**Limits**:
+
+- A subject can only be bound once per process. Two lanes must have distinct subject filters; a duplicate
+  subject throws (or is skipped when `throwOnDuplicate: false`).
+- Registration happens once, when consumers are mapped. Lane membership changes are picked up on the next
+  restart - which is what the control-plane lane-split runbook expects.
+- Durable consumers must already exist; the SDK attaches, it never creates.
 
 ### ⚡ High-Performance Processing
 

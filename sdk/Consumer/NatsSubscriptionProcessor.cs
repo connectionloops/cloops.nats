@@ -112,6 +112,22 @@ internal class NatsSubscriptionProcessor
     }
 
     #region bootstreap
+
+    /// <summary>
+    /// The consumer id this processor subscribes with.
+    /// </summary>
+    internal string RegisteredConsumerId => consumerId;
+
+    /// <summary>
+    /// Subjects bound to this processor, in registration order.
+    /// </summary>
+    internal IReadOnlyList<string> RegisteredSubjects => Subjects;
+
+    /// <summary>
+    /// Handler method bound to each subject.
+    /// </summary>
+    internal IReadOnlyDictionary<string, MethodInfo> RegisteredHandlers => handler;
+
     public void AddSubject(string subject, NatsConsumerAttribute _nca, Type _handlerClassType, MethodInfo _handler)
     {
         nca.Add(subject, _nca);
@@ -760,37 +776,10 @@ internal class NatsSubscriptionProcessor
         {
             throw new InvalidOperationException($"Can't find handler for subject {subject}");
         }
-        var parameters = _handler.GetParameters();
-        if (parameters.Length != 2)
-        {
-            throw new InvalidOperationException($"Invalid Handler: {_handler.Name} must have exactly 2 parameters: (NatsMsg<T> payload, CancellationToken).");
-        }
+        var payloadType = NatsConsumerHandlerSignature.GetPayloadType(_handler);
 
-        var messageType = parameters[0].ParameterType;
-        if (!messageType.IsGenericType || messageType.GetGenericTypeDefinition() != typeof(NatsMsg<>))
-        {
-            throw new InvalidOperationException($"Consumer method {_handler.Name} parameter[0] must be of type NatsMsg<T>.");
-        }
-
-        var messageGenericArguments = messageType.GetGenericArguments();
-        if (messageGenericArguments.Length != 1)
-        {
-            throw new InvalidOperationException($"Invalid Handler: {_handler.Name} must define exactly one generic type argument for its payload.");
-        }
-
-        // validate return type
-        var rt = _handler.ReturnType;
-        bool isReturnTypeValid =
-            rt.IsGenericType &&
-            rt.GetGenericTypeDefinition() == typeof(Task<>) &&
-            rt.GetGenericArguments()[0] == typeof(NatsAck);
-
-        if (!isReturnTypeValid)
-            throw new InvalidOperationException(
-                $"Handler {_handler.DeclaringType?.Name}.{_handler.Name} must return Task<NatsAck>.");
-
-        PayloadTypeCache[subject] = messageGenericArguments[0];
-        return messageGenericArguments[0];
+        PayloadTypeCache[subject] = payloadType;
+        return payloadType;
     }
 
     /// <summary>

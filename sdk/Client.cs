@@ -7,6 +7,8 @@ using CLOOPS.NATS.Attributes;
 using CLOOPS.NATS.Serialization;
 using NATS.Client.KeyValueStore;
 using CLOOPS.NATS.Locking;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 
 namespace CLOOPS.NATS;
 
@@ -56,7 +58,11 @@ public interface ICloopsNatsClient : INatsClient
     /// <param name="ct">Cancellation token.</param>
     /// <param name="assemblyNameFilters">Optional assembly simple name filters (exact or prefix, case-insensitive). If omitted / empty, scans all loaded assemblies.</param>
     /// <param name="throwOnDuplicate">If true, an exception will be thrown if a duplicate consumer is found. If false, the duplicate consumer will be ignored.</param>
-    public Task MapConsumers(IServiceProvider sp, CancellationToken ct = default, string[]? assemblyNameFilters = null, bool throwOnDuplicate = true);
+    /// <param name="dynamicConsumers">
+    /// Optional consumers discovered at runtime, registered in addition to the attribute decorated ones.
+    /// Any <see cref="INatsDynamicConsumerSource"/> registered in <paramref name="sp"/> is queried as well.
+    /// </param>
+    public Task MapConsumers(IServiceProvider sp, CancellationToken ct = default, string[]? assemblyNameFilters = null, bool throwOnDuplicate = true, IEnumerable<NatsDynamicConsumer>? dynamicConsumers = null);
 
     /// <summary>
     /// Sets Up All the KV Stores
@@ -212,11 +218,46 @@ public class CloopsNatsClient : ICloopsNatsClient
     /// <param name="ct">Cancellation token to abort discovery/registration.</param>
     /// <param name="assemblyNameFilters">Optional assembly simple names or prefixes (case-insensitive). When supplied, only assemblies whose simple name equals or starts with one of the filters are scanned.</param>
     /// <param name="throwOnDuplicate">If true, an exception will be thrown if a duplicate consumer is found. If false, the duplicate consumer will be ignored.</param>
+    /// <param name="dynamicConsumers">
+    /// Optional consumers discovered at runtime, registered in addition to the attribute decorated ones.
+    /// Any <see cref="INatsDynamicConsumerSource"/> registered in <paramref name="sp"/> is queried as well.
+    /// </param>
     /// <remarks>
     /// <para>Performance considerations: The method limits reflection cost by (1) filtering assemblies early, (2) using <see cref="MemberInfo.IsDefined(System.Type,bool)"/> for a fast attribute existence check before instantiation, (3) restricting method lookup to <c>DeclaredOnly</c> to avoid inherited duplication, and (4) gracefully handling partial type load failures.</para>
     /// <para>Idempotency: Repeated calls will create additional subscriptions; typically call once during startup.</para>
     /// </remarks>
-    public async Task MapConsumers(IServiceProvider sp, CancellationToken ct = default, string[]? assemblyNameFilters = null, bool throwOnDuplicate = true)
+    public async Task MapConsumers(IServiceProvider sp, CancellationToken ct = default, string[]? assemblyNameFilters = null, bool throwOnDuplicate = true, IEnumerable<NatsDynamicConsumer>? dynamicConsumers = null)
+    {
+        var consumerIdToSubscriptionProcessor = await BuildSubscriptionProcessors(sp, assemblyNameFilters, throwOnDuplicate, dynamicConsumers, ct).ConfigureAwait(false);
+
+        var registrationTasks = new List<Task>(consumerIdToSubscriptionProcessor.Count);
+        foreach (var sub in consumerIdToSubscriptionProcessor.Values)
+        {
+            registrationTasks.Add(sub.Setup(ct));
+        }
+
+        // Await all registration tasks
+        if (registrationTasks.Count > 0)
+        {
+            await Task.WhenAll(registrationTasks).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Discovers consumers (attribute decorated and runtime supplied) and builds one
+    /// <see cref="NatsSubscriptionProcessor"/> per consumer id, without starting them.
+    /// </summary>
+    /// <remarks>
+    /// The processor map is deliberately built once for <b>all</b> scanned assemblies: a consumer id
+    /// shared by two assemblies must resolve to a single processor, otherwise two processors would
+    /// attach to the same JetStream consumer.
+    /// </remarks>
+    internal async Task<Dictionary<string, NatsSubscriptionProcessor>> BuildSubscriptionProcessors(
+        IServiceProvider sp,
+        string[]? assemblyNameFilters,
+        bool throwOnDuplicate,
+        IEnumerable<NatsDynamicConsumer>? dynamicConsumers,
+        CancellationToken ct)
     {
         // Choose target assemblies (filter if provided)
         var allAssemblies = AppDomain.CurrentDomain.GetAssemblies();
@@ -231,8 +272,11 @@ public class CloopsNatsClient : ICloopsNatsClient
                 .ToArray()
             : allAssemblies;
 
-        var registrationTasks = new List<Task>();
         var subjectSet = new HashSet<string>();
+
+        // one nats subscription processor per consumer id (for all subjects it represents),
+        // shared across every scanned assembly and across runtime supplied consumers
+        Dictionary<string, NatsSubscriptionProcessor> consumerIdToSubscriptionProcessor = new();
 
         foreach (var assembly in targetAssemblies)
         {
@@ -246,8 +290,6 @@ public class CloopsNatsClient : ICloopsNatsClient
                 types = ex.Types.Where(t => t != null)!; // Skip types that failed to load
             }
 
-            // one nats subscription processor per consumer id (for all subjects it represents)
-            Dictionary<string, NatsSubscriptionProcessor> consumerIdToSubscriptionProcessor = new();
             foreach (var type in types)
             {
                 // Restrict binding flags to declared methods only to avoid scanning inherited base methods repeatedly
@@ -267,26 +309,97 @@ public class CloopsNatsClient : ICloopsNatsClient
                     }
 
                     subjectSet.Add(consumerAttr.Subject);
-                    // Create subscription processor and queue setup task
-                    consumerIdToSubscriptionProcessor.TryGetValue(consumerAttr.ConsumerId, out var sub);
-                    if (sub == null)
-                    {
-                        sub = new NatsSubscriptionProcessor(sp, this, consumerAttr.ConsumerId, _IsDurable: consumerAttr.IsDurable);
-                        consumerIdToSubscriptionProcessor.Add(consumerAttr.ConsumerId, sub);
-                    }
-                    sub.AddSubject(consumerAttr.Subject, consumerAttr, type, method);
+                    AddSubjectToProcessor(sp, consumerIdToSubscriptionProcessor, consumerAttr, type, method);
                 }
-            }
-            foreach (var sub in consumerIdToSubscriptionProcessor.Values)
-            {
-                registrationTasks.Add(sub.Setup(ct));
             }
         }
 
-        // Await all registration tasks
-        if (registrationTasks.Count > 0)
+        // Runtime supplied consumers go through the exact same registration path
+        var runtimeConsumers = await ResolveDynamicConsumers(sp, dynamicConsumers, ct).ConfigureAwait(false);
+        foreach (var dynamicConsumer in runtimeConsumers)
         {
-            await Task.WhenAll(registrationTasks).ConfigureAwait(false);
+            if (subjectSet.Contains(dynamicConsumer.Subject))
+            {
+                if (throwOnDuplicate)
+                {
+                    // Runtime registrations come from application code while the host is starting,
+                    // so throw (and let the lifecycle service report it) instead of FailFast-ing.
+                    throw new InvalidOperationException(
+                        $"Duplicate consumer found for subject {dynamicConsumer.Subject} supplied as a dynamic consumer. Please make sure you have only one consumer per subject.");
+                }
+
+                continue; // duplicate ignored
+            }
+
+            subjectSet.Add(dynamicConsumer.Subject);
+            AddSubjectToProcessor(sp, consumerIdToSubscriptionProcessor, dynamicConsumer.Attribute, dynamicConsumer.HandlerType, dynamicConsumer.HandlerMethod);
+        }
+
+        return consumerIdToSubscriptionProcessor;
+    }
+
+    /// <summary>
+    /// Gets (or creates) the processor owning <paramref name="consumerAttr"/>'s consumer id and binds the subject to it.
+    /// </summary>
+    private void AddSubjectToProcessor(
+        IServiceProvider sp,
+        Dictionary<string, NatsSubscriptionProcessor> consumerIdToSubscriptionProcessor,
+        NatsConsumerAttribute consumerAttr,
+        Type handlerClassType,
+        MethodInfo handlerMethod)
+    {
+        // Create subscription processor and queue setup task
+        consumerIdToSubscriptionProcessor.TryGetValue(consumerAttr.ConsumerId, out var sub);
+        if (sub == null)
+        {
+            sub = new NatsSubscriptionProcessor(sp, this, consumerAttr.ConsumerId, _IsDurable: consumerAttr.IsDurable);
+            consumerIdToSubscriptionProcessor.Add(consumerAttr.ConsumerId, sub);
+        }
+        sub.AddSubject(consumerAttr.Subject, consumerAttr, handlerClassType, handlerMethod);
+    }
+
+    /// <summary>
+    /// Merges the explicitly supplied runtime consumers with everything the registered
+    /// <see cref="INatsDynamicConsumerSource"/> implementations return.
+    /// </summary>
+    private static async Task<List<NatsDynamicConsumer>> ResolveDynamicConsumers(
+        IServiceProvider sp,
+        IEnumerable<NatsDynamicConsumer>? dynamicConsumers,
+        CancellationToken ct)
+    {
+        var resolved = new List<NatsDynamicConsumer>();
+        if (dynamicConsumers != null)
+        {
+            AddAll(resolved, dynamicConsumers, "the dynamicConsumers argument");
+        }
+
+        var logger = sp.GetService<ILogger<CloopsNatsClient>>();
+
+        foreach (var source in sp.GetServices<INatsDynamicConsumerSource>())
+        {
+            var fromSource = await source.GetConsumersAsync(ct).ConfigureAwait(false);
+            if (fromSource == null)
+            {
+                throw new InvalidOperationException(
+                    $"Dynamic consumer source {source.GetType().FullName} returned null. Return an empty collection instead.");
+            }
+
+            logger?.LogInformation("Dynamic consumer source {Source} supplied {Count} NATS consumer(s)", source.GetType().Name, fromSource.Count);
+            AddAll(resolved, fromSource, source.GetType().FullName ?? "a dynamic consumer source");
+        }
+
+        return resolved;
+
+        static void AddAll(List<NatsDynamicConsumer> target, IEnumerable<NatsDynamicConsumer> items, string origin)
+        {
+            foreach (var item in items)
+            {
+                if (item is null)
+                {
+                    throw new InvalidOperationException($"A null NatsDynamicConsumer was supplied by {origin}.");
+                }
+                target.Add(item);
+            }
         }
     }
 
