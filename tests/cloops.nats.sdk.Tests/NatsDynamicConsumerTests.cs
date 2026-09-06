@@ -294,7 +294,256 @@ public class NatsDynamicConsumerTests
         Assert.Equal(["probe.merge.a", "probe.merge.b"], processor.RegisteredSubjects.Order());
     }
 
+
+    [Fact]
+    public async Task BuildSubscriptionProcessors_AttributePath_ThrowsOnDuplicateSubject_WhenConsumerIdIsShared()
+    {
+        // Characterisation of PRE-EXISTING behaviour, not something this change introduced.
+        // throwOnDuplicate:false does NOT skip the duplicate on the attribute path: the subject is bound
+        // again on the same processor and the inner dictionary rejects it.
+        const string prefix = "CloopsNatsDupeSameIdProbe";
+        EmittedConsumerAssembly.Ensure($"{prefix}.A", "probe.dupe.same", "probe-dupe-same");
+        EmittedConsumerAssembly.Ensure($"{prefix}.B", "probe.dupe.same", "probe-dupe-same");
+
+        await using var client = NewClient();
+        using var sp = NewServiceProvider(services =>
+        {
+            foreach (var type in EmittedConsumerAssembly.TypesFor(prefix)) services.AddSingleton(type);
+        });
+
+        var ex = await Assert.ThrowsAsync<ArgumentException>(() =>
+            client.BuildSubscriptionProcessors(sp, [prefix], throwOnDuplicate: false, dynamicConsumers: null, CancellationToken.None));
+
+        Assert.Contains("same key has already been added", ex.Message);
+    }
+
+    [Fact]
+    public async Task BuildSubscriptionProcessors_AttributePath_SilentlyDoubleBinds_WhenConsumerIdsDiffer()
+    {
+        // Characterisation of PRE-EXISTING behaviour: with throwOnDuplicate:false and different consumer
+        // ids, the same subject is bound to two processors and is delivered to both.
+        const string prefix = "CloopsNatsDupeDiffIdProbe";
+        EmittedConsumerAssembly.Ensure($"{prefix}.A", "probe.dupe.diff", "probe-dupe-a");
+        EmittedConsumerAssembly.Ensure($"{prefix}.B", "probe.dupe.diff", "probe-dupe-b");
+
+        await using var client = NewClient();
+        using var sp = NewServiceProvider(services =>
+        {
+            foreach (var type in EmittedConsumerAssembly.TypesFor(prefix)) services.AddSingleton(type);
+        });
+
+        var processors = await client.BuildSubscriptionProcessors(
+            sp, [prefix], throwOnDuplicate: false, dynamicConsumers: null, CancellationToken.None);
+
+        Assert.Equal(2, processors.Count);
+        Assert.All(processors.Values, p => Assert.Equal(["probe.dupe.diff"], p.RegisteredSubjects));
+    }
+
     #endregion assembly scan
+
+    #region dispatch
+
+    [Fact]
+    public async Task DynamicConsumer_CompilesAndDispatchesToTheBoundHandler()
+    {
+        // Coverage past processor construction: this runs everything Setup() does except opening the
+        // subscription - payload type validation, invoker compilation and handler dispatch. Opening the
+        // subscription itself needs a live NATS server and is not covered by this suite.
+        await using var client = NewClient();
+        using var sp = NewServiceProvider();
+
+        var processors = await client.BuildSubscriptionProcessors(
+            sp,
+            NoAssemblies,
+            throwOnDuplicate: true,
+            dynamicConsumers: [NewConsumer("cbb.lane.7.>", "cbb-lane-7")],
+            CancellationToken.None);
+
+        var processor = Assert.Single(processors).Value;
+        processor.BuildInvocationPlans();
+
+        var plan = processor.GetInvocationPlan("cbb.lane.7.>");
+        Assert.Equal(typeof(LanePayload), plan.PayloadType);
+        Assert.Equal(nameof(LaneConsumer.Handle), plan.HandlerName);
+
+        var msg = new NatsMsg<LanePayload>(
+            subject: "cbb.lane.7.work",
+            replyTo: null,
+            size: 0,
+            headers: null,
+            data: new LanePayload { Id = "lane-7" },
+            connection: null!,
+            flags: default);
+
+        var ack = await plan.Invoke(msg, CancellationToken.None);
+
+        Assert.True(ack.IsAcknowledged);
+        Assert.Equal("lane-7", ack.Reply);
+        Assert.Equal("lane-7", sp.GetRequiredService<LaneConsumer>().LastSeenId);
+    }
+
+    [Fact]
+    public async Task BuildInvocationPlans_CompilesEveryLaneBoundToOneHandler()
+    {
+        await using var client = NewClient();
+        using var sp = NewServiceProvider();
+
+        var lanes = Enumerable.Range(1, 3)
+            .Select(i => NewConsumer($"cbb.lane.{i}.>", $"cbb-lane-{i}"))
+            .ToArray();
+
+        var processors = await client.BuildSubscriptionProcessors(
+            sp, NoAssemblies, throwOnDuplicate: true, dynamicConsumers: lanes, CancellationToken.None);
+
+        foreach (var (consumerId, processor) in processors)
+        {
+            processor.BuildInvocationPlans();
+            var subject = processor.RegisteredSubjects.Single();
+            var plan = processor.GetInvocationPlan(subject);
+
+            var msg = new NatsMsg<LanePayload>(
+                subject: subject.Replace(">", "work"),
+                replyTo: null,
+                size: 0,
+                headers: null,
+                data: new LanePayload { Id = consumerId },
+                connection: null!,
+                flags: default);
+
+            var ack = await plan.Invoke(msg, CancellationToken.None);
+            Assert.Equal(consumerId, ack.Reply);
+        }
+    }
+
+    #endregion dispatch
+
+    #region discovery timeout
+
+    [Fact]
+    public async Task BuildSubscriptionProcessors_Throws_WhenSourceExceedsDiscoveryTimeout()
+    {
+        using var _ = new EnvVar("NATS_DYNAMIC_CONSUMER_DISCOVERY_TIMEOUT_SECONDS", "1");
+        await using var client = NewClient();
+        using var sp = NewServiceProvider(services => services.AddNatsDynamicConsumerSource<HangingSource>());
+
+        var ex = await Assert.ThrowsAsync<TimeoutException>(() =>
+            client.BuildSubscriptionProcessors(sp, NoAssemblies, throwOnDuplicate: true, dynamicConsumers: null, CancellationToken.None));
+
+        Assert.Contains(nameof(HangingSource), ex.Message);
+        Assert.Contains("NATS_DYNAMIC_CONSUMER_DISCOVERY_TIMEOUT_SECONDS", ex.Message);
+    }
+
+    [Fact]
+    public async Task BuildSubscriptionProcessors_Throws_WhenSourceIgnoresItsCancellationToken()
+    {
+        using var _ = new EnvVar("NATS_DYNAMIC_CONSUMER_DISCOVERY_TIMEOUT_SECONDS", "1");
+        await using var client = NewClient();
+        using var sp = NewServiceProvider(services => services.AddNatsDynamicConsumerSource<TokenIgnoringSource>());
+
+        var ex = await Assert.ThrowsAsync<TimeoutException>(() =>
+            client.BuildSubscriptionProcessors(sp, NoAssemblies, throwOnDuplicate: true, dynamicConsumers: null, CancellationToken.None));
+
+        Assert.Contains("did not honour its cancellation token", ex.Message);
+    }
+
+    [Fact]
+    public async Task BuildSubscriptionProcessors_PropagatesCallerCancellation_AsOperationCanceled()
+    {
+        // A cancelled host shutdown must not be misreported as a discovery timeout.
+        using var _ = new EnvVar("NATS_DYNAMIC_CONSUMER_DISCOVERY_TIMEOUT_SECONDS", "600");
+        await using var client = NewClient();
+        using var sp = NewServiceProvider(services => services.AddNatsDynamicConsumerSource<HangingSource>());
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(250));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            client.BuildSubscriptionProcessors(sp, NoAssemblies, throwOnDuplicate: true, dynamicConsumers: null, cts.Token));
+    }
+
+    [Fact]
+    public async Task BuildSubscriptionProcessors_DoesNotTimeOutAPromptSource()
+    {
+        using var _ = new EnvVar("NATS_DYNAMIC_CONSUMER_DISCOVERY_TIMEOUT_SECONDS", "30");
+        await using var client = NewClient();
+        using var sp = NewServiceProvider(services => services.AddNatsDynamicConsumerSource<LaneSource>());
+
+        var processors = await client.BuildSubscriptionProcessors(
+            sp, NoAssemblies, throwOnDuplicate: true, dynamicConsumers: null, CancellationToken.None);
+
+        Assert.Equal(2, processors.Count);
+    }
+
+    [Fact]
+    public void GetDynamicConsumerDiscoveryTimeout_DefaultsTo30Seconds()
+    {
+        using var _ = new EnvVar("NATS_DYNAMIC_CONSUMER_DISCOVERY_TIMEOUT_SECONDS", null);
+
+        Assert.Equal(30, CloopsNatsClient.DefaultDynamicConsumerDiscoveryTimeoutSeconds);
+        Assert.Equal(TimeSpan.FromSeconds(30), CloopsNatsClient.GetDynamicConsumerDiscoveryTimeout());
+    }
+
+    [Theory]
+    [InlineData("0")]
+    [InlineData("-1")]
+    public void GetDynamicConsumerDiscoveryTimeout_CanBeDisabled(string value)
+    {
+        using var _ = new EnvVar("NATS_DYNAMIC_CONSUMER_DISCOVERY_TIMEOUT_SECONDS", value);
+
+        Assert.Equal(Timeout.InfiniteTimeSpan, CloopsNatsClient.GetDynamicConsumerDiscoveryTimeout());
+    }
+
+    [Fact]
+    public void GetDynamicConsumerDiscoveryTimeout_FallsBackToDefault_WhenValueIsNotAnInteger()
+    {
+        using var _ = new EnvVar("NATS_DYNAMIC_CONSUMER_DISCOVERY_TIMEOUT_SECONDS", "not-a-number");
+
+        Assert.Equal(TimeSpan.FromSeconds(30), CloopsNatsClient.GetDynamicConsumerDiscoveryTimeout());
+    }
+
+    #endregion discovery timeout
+
+    #region overloads
+
+    [Theory]
+    [InlineData(typeof(ICloopsNatsClient))]
+    [InlineData(typeof(CloopsNatsClient))]
+    public void MapConsumers_KeepsTheFourParameterMember(Type declaringType)
+    {
+        // Binary compatibility guard. C# binds optional arguments at the call site, so turning the four
+        // parameter method into a five parameter one with a default would delete this member reference and
+        // break already-compiled callers (cloops.microservices 1.1.25 calls exactly this signature) with a
+        // MissingMethodException at consumer startup. The new argument must stay a separate overload.
+        var fourParam = declaringType.GetMethod(
+            nameof(ICloopsNatsClient.MapConsumers),
+            [typeof(IServiceProvider), typeof(CancellationToken), typeof(string[]), typeof(bool)]);
+
+        Assert.NotNull(fourParam);
+        Assert.Equal(typeof(Task), fourParam!.ReturnType);
+
+        var fiveParam = declaringType.GetMethod(
+            nameof(ICloopsNatsClient.MapConsumers),
+            [typeof(IServiceProvider), typeof(CancellationToken), typeof(string[]), typeof(bool), typeof(IEnumerable<NatsDynamicConsumer>)]);
+
+        Assert.NotNull(fiveParam);
+
+        // The added parameter must NOT be optional, otherwise a four argument call becomes ambiguous.
+        Assert.False(fiveParam!.GetParameters()[4].IsOptional);
+    }
+
+    [Fact]
+    public async Task MapConsumers_FourArgumentOverload_DelegatesToTheNewOne()
+    {
+        await using var client = NewClient();
+        using var sp = NewServiceProvider();
+        ICloopsNatsClient asInterface = client;
+
+        // Every arity an existing caller may have compiled against, minus the unfiltered ones: scanning
+        // every loaded assembly trips over the test platform's own assemblies (pre-existing behaviour).
+        await asInterface.MapConsumers(sp, CancellationToken.None, NoAssemblies, true);
+        await asInterface.MapConsumers(sp, CancellationToken.None, NoAssemblies);
+        await asInterface.MapConsumers(sp, CancellationToken.None, NoAssemblies, true, null);
+    }
+
+    #endregion overloads
 
     #region helpers
 
@@ -324,8 +573,13 @@ public class NatsDynamicConsumerTests
     /// <summary>A well formed consumer handler.</summary>
     public class LaneConsumer
     {
+        public string? LastSeenId { get; private set; }
+
         public Task<NatsAck> Handle(NatsMsg<LanePayload> msg, CancellationToken ct = default)
-            => Task.FromResult(new NatsAck(true));
+        {
+            LastSeenId = msg.Data?.Id;
+            return Task.FromResult(new NatsAck(true, msg.Data?.Id));
+        }
     }
 
     /// <summary>Handlers that violate the consumer contract.</summary>
@@ -404,6 +658,42 @@ public class NatsDynamicConsumerTests
                     .ToArray();
             }
         }
+    }
+
+    /// <summary>A source that never returns, honouring its cancellation token.</summary>
+    public class HangingSource : INatsDynamicConsumerSource
+    {
+        public async ValueTask<IReadOnlyCollection<NatsDynamicConsumer>> GetConsumersAsync(CancellationToken ct = default)
+        {
+            await Task.Delay(Timeout.Infinite, ct);
+            return [];
+        }
+    }
+
+    /// <summary>A source that overruns its budget and ignores the cancellation token it was given.</summary>
+    public class TokenIgnoringSource : INatsDynamicConsumerSource
+    {
+        public async ValueTask<IReadOnlyCollection<NatsDynamicConsumer>> GetConsumersAsync(CancellationToken ct = default)
+        {
+            await Task.Delay(TimeSpan.FromSeconds(2), CancellationToken.None);
+            return [];
+        }
+    }
+
+    /// <summary>Sets an environment variable for the duration of a test and restores it afterwards.</summary>
+    private sealed class EnvVar : IDisposable
+    {
+        private readonly string _name;
+        private readonly string? _previous;
+
+        public EnvVar(string name, string? value)
+        {
+            _name = name;
+            _previous = Environment.GetEnvironmentVariable(name);
+            Environment.SetEnvironmentVariable(name, value);
+        }
+
+        public void Dispose() => Environment.SetEnvironmentVariable(_name, _previous);
     }
 
     #endregion helpers

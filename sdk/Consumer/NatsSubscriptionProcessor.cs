@@ -149,6 +149,36 @@ internal class NatsSubscriptionProcessor
         UseBatching = _UseBatching;
         BatchTimeoutMs = _BatchTimeoutMs;
     }
+    /// <summary>
+    /// Validates every bound handler signature and compiles its invoker.
+    /// </summary>
+    /// <remarks>
+    /// Split out of <see cref="Setup"/> so the binding can be validated and exercised without opening a
+    /// NATS subscription. Throws for any handler that does not match the consumer contract.
+    /// </remarks>
+    internal void BuildInvocationPlans()
+    {
+        // validation
+        foreach (string subject in Subjects)
+        {
+            // populates cache and performs validations.
+            var payloadType = GetPayloadType(subject);
+
+            // Compile the handler invoker once, after the signature has been validated.
+            plans[subject] = new NatsConsumerInvocationPlan(
+                subject,
+                payloadType,
+                handlerClassType[subject],
+                handler[subject],
+                handlerClassInstance[subject]);
+        }
+    }
+
+    /// <summary>
+    /// The compiled invocation plan bound to a subject. Call <see cref="BuildInvocationPlans"/> first.
+    /// </summary>
+    internal NatsConsumerInvocationPlan GetInvocationPlan(string subject) => plans[subject];
+
     #endregion bootstrap
 
     #region setup
@@ -168,20 +198,7 @@ internal class NatsSubscriptionProcessor
     /// </remarks>
     internal async Task Setup(CancellationToken ct)
     {
-        // validation
-        foreach (string subject in Subjects)
-        {
-            // populates cache and performs validations.
-            var payloadType = GetPayloadType(subject);
-
-            // Compile the handler invoker once, after the signature has been validated.
-            plans[subject] = new NatsConsumerInvocationPlan(
-                subject,
-                payloadType,
-                handlerClassType[subject],
-                handler[subject],
-                handlerClassInstance[subject]);
-        }
+        BuildInvocationPlans();
 
         // subject matcher
         subjectMatcher = new NatsSubjectMatcher(Subjects);

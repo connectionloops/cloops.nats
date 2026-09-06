@@ -147,13 +147,17 @@ public sealed class NatsDynamicConsumer
 /// Register an implementation with
 /// <see cref="NatsDynamicConsumerServiceCollectionExtensions.AddNatsDynamicConsumerSource{TSource}"/>
 /// before the host starts. All registered sources are resolved and awaited once, at the start of
-/// <see cref="ICloopsNatsClient.MapConsumers"/>, and their consumers are registered alongside the
+/// <see cref="ICloopsNatsClient.MapConsumers(IServiceProvider,CancellationToken,string[],bool)"/>, and their consumers are registered alongside the
 /// ones discovered from <see cref="NatsConsumerAttribute"/>.
 /// </para>
 /// <para>
 /// The call is asynchronous so an implementation can query NATS (for example, list the durable
 /// consumers that currently exist on a stream) before deciding what to bind. It runs while the
-/// host is starting, so keep it bounded - a hanging source blocks consumer startup.
+/// host is starting and <b>before any subscription is opened</b>, so a source that hangs stalls every
+/// consumer - including attribute declared ones - while the host still reports healthy. Each source is
+/// therefore given a bounded budget (30s by default, see
+/// <c>NATS_DYNAMIC_CONSUMER_DISCOVERY_TIMEOUT_SECONDS</c>); exceeding it throws a
+/// <see cref="TimeoutException"/>. Honour the supplied <see cref="CancellationToken"/>.
 /// </para>
 /// <para>
 /// Sources are resolved as singletons, in registration order, at <c>MapConsumers</c> time. Like

@@ -166,13 +166,27 @@ The handler class is resolved from DI (`GetRequiredService`), so it must be regi
 consumer class. Consumers can also be passed straight to `MapConsumers(..., dynamicConsumers: [...])`
 when the caller owns the lifecycle.
 
+**Discovery is bounded**: subscriptions only start once every source has returned, so a source that hangs
+would stall **all** consumers - including attribute declared ones - while the pod still reports healthy and
+ready. Each source therefore gets a budget of **30 seconds**
+(`NATS_DYNAMIC_CONSUMER_DISCOVERY_TIMEOUT_SECONDS`, `0` disables it). On expiry the SDK logs `Critical` and
+throws `TimeoutException` - a crash-loop is visible, a silently idle pod is not.
+
 **Limits**:
 
-- A subject can only be bound once per process. Two lanes must have distinct subject filters; a duplicate
-  subject throws (or is skipped when `throwOnDuplicate: false`).
+- A subject can only be bound once per process. Two lanes must have distinct subject filters.
 - Registration happens once, when consumers are mapped. Lane membership changes are picked up on the next
   restart - which is what the control-plane lane-split runbook expects.
 - Durable consumers must already exist; the SDK attaches, it never creates.
+
+**Duplicate subject handling** - the two paths differ, and the attribute path behaviour is pre-existing:
+
+| Path | `throwOnDuplicate: true` | `throwOnDuplicate: false` |
+| --- | --- | --- |
+| `[NatsConsumer]` attribute | `Environment.FailFast` - the process is killed | ⚠️ the duplicate is **not** ignored. Same consumer id -> `ArgumentException: An item with the same key has already been added`. Different consumer ids -> the subject is **silently bound twice** and every message is delivered to both handlers |
+| `NatsDynamicConsumer` | `InvalidOperationException` - it throws rather than `FailFast`, since runtime registrations come from application code | the duplicate registration is skipped |
+
+Do not rely on `throwOnDuplicate: false` to deduplicate attribute declared consumers; it does not.
 
 ### ⚡ High-Performance Processing
 

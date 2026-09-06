@@ -57,12 +57,39 @@ public interface ICloopsNatsClient : INatsClient
     /// <param name="sp">Service provider.</param>
     /// <param name="ct">Cancellation token.</param>
     /// <param name="assemblyNameFilters">Optional assembly simple name filters (exact or prefix, case-insensitive). If omitted / empty, scans all loaded assemblies.</param>
-    /// <param name="throwOnDuplicate">If true, an exception will be thrown if a duplicate consumer is found. If false, the duplicate consumer will be ignored.</param>
+    /// <param name="throwOnDuplicate">If true, the process fails fast if a duplicate consumer subject is found. If false, the duplicate is not reported here (see remarks).</param>
+    /// <remarks>
+    /// Any <see cref="INatsDynamicConsumerSource"/> registered in <paramref name="sp"/> is queried as well,
+    /// so runtime consumer registration needs no change at this call site.
+    /// </remarks>
+    public Task MapConsumers(IServiceProvider sp, CancellationToken ct = default, string[]? assemblyNameFilters = null, bool throwOnDuplicate = true);
+
+    /// <summary>
+    /// Same as <see cref="MapConsumers(IServiceProvider,CancellationToken,string[],bool)"/>, plus consumers
+    /// supplied directly by the caller.
+    /// </summary>
+    /// <param name="sp">Service provider.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <param name="assemblyNameFilters">Optional assembly simple name filters (exact or prefix, case-insensitive). If omitted / empty, scans all loaded assemblies.</param>
+    /// <param name="throwOnDuplicate">If true, a duplicate consumer subject is reported instead of being ignored.</param>
     /// <param name="dynamicConsumers">
-    /// Optional consumers discovered at runtime, registered in addition to the attribute decorated ones.
-    /// Any <see cref="INatsDynamicConsumerSource"/> registered in <paramref name="sp"/> is queried as well.
+    /// Consumers discovered at runtime, registered in addition to the attribute decorated ones and to
+    /// anything the registered <see cref="INatsDynamicConsumerSource"/> implementations return.
     /// </param>
-    public Task MapConsumers(IServiceProvider sp, CancellationToken ct = default, string[]? assemblyNameFilters = null, bool throwOnDuplicate = true, IEnumerable<NatsDynamicConsumer>? dynamicConsumers = null);
+    /// <remarks>
+    /// This is a separate overload rather than an optional parameter on the four argument method on purpose:
+    /// C# binds optional arguments at the call site, so adding one would remove the four argument member
+    /// reference and break already-compiled callers at runtime.
+    /// Most applications should register an <see cref="INatsDynamicConsumerSource"/> instead of calling this;
+    /// it is here for callers that own the consumer lifecycle themselves.
+    /// </remarks>
+    public Task MapConsumers(IServiceProvider sp, CancellationToken ct, string[]? assemblyNameFilters, bool throwOnDuplicate, IEnumerable<NatsDynamicConsumer>? dynamicConsumers)
+        // Default implementation so existing ICloopsNatsClient implementations keep compiling. It cannot
+        // honour dynamicConsumers, so it refuses loudly rather than silently dropping them.
+        => dynamicConsumers is null || !dynamicConsumers.Any()
+            ? MapConsumers(sp, ct, assemblyNameFilters, throwOnDuplicate)
+            : throw new NotSupportedException(
+                $"{GetType().FullName} does not implement dynamic NATS consumer registration. Use CloopsNatsClient, or override this overload.");
 
     /// <summary>
     /// Sets Up All the KV Stores
@@ -217,16 +244,17 @@ public class CloopsNatsClient : ICloopsNatsClient
     /// <param name="sp">Service provider used to resolve any dependencies required by consumer containing types.</param>
     /// <param name="ct">Cancellation token to abort discovery/registration.</param>
     /// <param name="assemblyNameFilters">Optional assembly simple names or prefixes (case-insensitive). When supplied, only assemblies whose simple name equals or starts with one of the filters are scanned.</param>
-    /// <param name="throwOnDuplicate">If true, an exception will be thrown if a duplicate consumer is found. If false, the duplicate consumer will be ignored.</param>
-    /// <param name="dynamicConsumers">
-    /// Optional consumers discovered at runtime, registered in addition to the attribute decorated ones.
-    /// Any <see cref="INatsDynamicConsumerSource"/> registered in <paramref name="sp"/> is queried as well.
-    /// </param>
+    /// <param name="throwOnDuplicate">If true, the process fails fast if a duplicate consumer subject is found.</param>
     /// <remarks>
     /// <para>Performance considerations: The method limits reflection cost by (1) filtering assemblies early, (2) using <see cref="MemberInfo.IsDefined(System.Type,bool)"/> for a fast attribute existence check before instantiation, (3) restricting method lookup to <c>DeclaredOnly</c> to avoid inherited duplication, and (4) gracefully handling partial type load failures.</para>
     /// <para>Idempotency: Repeated calls will create additional subscriptions; typically call once during startup.</para>
+    /// <para>Any <see cref="INatsDynamicConsumerSource"/> registered in <paramref name="sp"/> is queried as well.</para>
     /// </remarks>
-    public async Task MapConsumers(IServiceProvider sp, CancellationToken ct = default, string[]? assemblyNameFilters = null, bool throwOnDuplicate = true, IEnumerable<NatsDynamicConsumer>? dynamicConsumers = null)
+    public Task MapConsumers(IServiceProvider sp, CancellationToken ct = default, string[]? assemblyNameFilters = null, bool throwOnDuplicate = true)
+        => MapConsumers(sp, ct, assemblyNameFilters, throwOnDuplicate, dynamicConsumers: null);
+
+    /// <inheritdoc />
+    public async Task MapConsumers(IServiceProvider sp, CancellationToken ct, string[]? assemblyNameFilters, bool throwOnDuplicate, IEnumerable<NatsDynamicConsumer>? dynamicConsumers)
     {
         var consumerIdToSubscriptionProcessor = await BuildSubscriptionProcessors(sp, assemblyNameFilters, throwOnDuplicate, dynamicConsumers, ct).ConfigureAwait(false);
 
@@ -359,9 +387,39 @@ public class CloopsNatsClient : ICloopsNatsClient
     }
 
     /// <summary>
+    /// Default per-source budget for <see cref="INatsDynamicConsumerSource.GetConsumersAsync"/>, in seconds.
+    /// </summary>
+    /// <remarks>
+    /// Discovery runs after the connection is up and is normally a single JetStream metadata round trip
+    /// (sub-second on a healthy cluster), so 30s is generous by an order of magnitude while still bounding
+    /// a hang well inside a typical Kubernetes startup budget. Override with
+    /// <c>NATS_DYNAMIC_CONSUMER_DISCOVERY_TIMEOUT_SECONDS</c>; <c>0</c> or a negative value disables the
+    /// timeout (not recommended - a hanging source blocks every consumer, including attribute declared ones).
+    /// </remarks>
+    internal const int DefaultDynamicConsumerDiscoveryTimeoutSeconds = 30;
+
+    /// <summary>
+    /// Resolves the discovery timeout from <c>NATS_DYNAMIC_CONSUMER_DISCOVERY_TIMEOUT_SECONDS</c>.
+    /// </summary>
+    internal static TimeSpan GetDynamicConsumerDiscoveryTimeout()
+    {
+        var seconds = int.TryParse(Environment.GetEnvironmentVariable("NATS_DYNAMIC_CONSUMER_DISCOVERY_TIMEOUT_SECONDS"), out int configured)
+            ? configured
+            : DefaultDynamicConsumerDiscoveryTimeoutSeconds;
+
+        return seconds <= 0 ? Timeout.InfiniteTimeSpan : TimeSpan.FromSeconds(seconds);
+    }
+
+    /// <summary>
     /// Merges the explicitly supplied runtime consumers with everything the registered
     /// <see cref="INatsDynamicConsumerSource"/> implementations return.
     /// </summary>
+    /// <remarks>
+    /// Every source is given a bounded budget. Subscriptions are only started once discovery finishes, so
+    /// a source that never returns would otherwise stall <b>all</b> consumers - including attribute declared
+    /// ones - while the host stays healthy and ready but consumes nothing. Expiry is therefore a loud
+    /// <see cref="TimeoutException"/>, not a warning.
+    /// </remarks>
     private static async Task<List<NatsDynamicConsumer>> ResolveDynamicConsumers(
         IServiceProvider sp,
         IEnumerable<NatsDynamicConsumer>? dynamicConsumers,
@@ -374,18 +432,52 @@ public class CloopsNatsClient : ICloopsNatsClient
         }
 
         var logger = sp.GetService<ILogger<CloopsNatsClient>>();
-
-        foreach (var source in sp.GetServices<INatsDynamicConsumerSource>())
+        var sources = sp.GetServices<INatsDynamicConsumerSource>().ToArray();
+        if (sources.Length == 0)
         {
-            var fromSource = await source.GetConsumersAsync(ct).ConfigureAwait(false);
+            return resolved;
+        }
+
+        var timeout = GetDynamicConsumerDiscoveryTimeout();
+
+        foreach (var source in sources)
+        {
+            var sourceName = source.GetType().FullName ?? source.GetType().Name;
+
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            if (timeout != Timeout.InfiniteTimeSpan)
+            {
+                timeoutCts.CancelAfter(timeout);
+            }
+
+            IReadOnlyCollection<NatsDynamicConsumer>? fromSource;
+            try
+            {
+                fromSource = await source.GetConsumersAsync(timeoutCts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !ct.IsCancellationRequested)
+            {
+                logger?.LogCritical("Dynamic consumer source {Source} did not return within {DiscoveryTimeout}; no NATS consumers were started", sourceName, timeout);
+                throw new TimeoutException(
+                    $"Dynamic consumer source {sourceName} did not return within {timeout}. Consumer startup is blocked until every source completes; keep discovery bounded or raise NATS_DYNAMIC_CONSUMER_DISCOVERY_TIMEOUT_SECONDS.");
+            }
+
+            // A source that ignores its cancellation token still gets caught here.
+            if (timeoutCts.IsCancellationRequested && !ct.IsCancellationRequested)
+            {
+                logger?.LogCritical("Dynamic consumer source {Source} exceeded {DiscoveryTimeout} and ignored its cancellation token; no NATS consumers were started", sourceName, timeout);
+                throw new TimeoutException(
+                    $"Dynamic consumer source {sourceName} exceeded {timeout} and did not honour its cancellation token. Consumer startup is blocked until every source completes; keep discovery bounded or raise NATS_DYNAMIC_CONSUMER_DISCOVERY_TIMEOUT_SECONDS.");
+            }
+
             if (fromSource == null)
             {
                 throw new InvalidOperationException(
-                    $"Dynamic consumer source {source.GetType().FullName} returned null. Return an empty collection instead.");
+                    $"Dynamic consumer source {sourceName} returned null. Return an empty collection instead.");
             }
 
             logger?.LogInformation("Dynamic consumer source {Source} supplied {Count} NATS consumer(s)", source.GetType().Name, fromSource.Count);
-            AddAll(resolved, fromSource, source.GetType().FullName ?? "a dynamic consumer source");
+            AddAll(resolved, fromSource, sourceName);
         }
 
         return resolved;

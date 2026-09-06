@@ -8,6 +8,10 @@
 - `NATS_CONSUMER_MAX_DOP`
   - Defines maximum degree of parallelism for all consumers. These many messages can be processed in parallel from the message queue. Default: 128
   - This puts upper limit on rps (request per second), not literally, but indirectly. e.g. if your avg latency to process a message is 200ms then max_dop \* 5 is your max throughput. Increase this in order to support higher rps. Consider giving higher core / memory count as well.
+- `NATS_DYNAMIC_CONSUMER_DISCOVERY_TIMEOUT_SECONDS`
+  - Per-source budget for `INatsDynamicConsumerSource.GetConsumersAsync`, which runs while consumers are being mapped. Default: 30
+  - Subscriptions only start once every source has returned, so a source that hangs stalls *all* consumers - including attribute declared ones - while the pod still reports healthy and ready. On expiry the SDK logs `Critical` and throws `TimeoutException`.
+  - Discovery is normally a single JetStream metadata round trip, so the default is already generous. Raise it only if your discovery legitimately needs longer; set `0` to disable the timeout entirely (not recommended).
 - (Optional) Minting Service related environment variables
   - Highly confidential. Only use in trusted services.
   - Used by minting service when you need your application to mint new Nats Tokens.
