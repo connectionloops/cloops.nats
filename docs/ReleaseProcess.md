@@ -77,7 +77,10 @@ To update the major or minor version:
 - **Target Framework**: .NET 9.0+
 - **Dependencies**: Automatically managed via .csproj files
 - **Package Repository**: NuGet.org (public feed)
-- **API Key**: Stored as GitHub secret `NUGET_API_KEY`
+- **Authentication**: NuGet [Trusted Publishing](https://learn.microsoft.com/en-us/nuget/nuget-org/trusted-publishing) - no stored API key.
+  The policy on nuget.org (owner `cloops`, account `gskalele`) trusts `connectionloops/cloops.nats` → workflow `ci.yml` → environment `production`.
+  Each run exchanges its GitHub OIDC token for a short-lived key via `NuGet/login@v1`; there is nothing to rotate or expire.
+  If the repository, workflow filename, or environment name changes, the policy on nuget.org must be updated to match or publishing fails with 403.
 
 ### Publishing Process
 
@@ -87,7 +90,7 @@ The publish job automatically:
 2. Builds the project in Release configuration
 3. Creates the NuGet package (`.nupkg` file)
 4. Uploads the package as a build artifact
-5. Publishes to NuGet.org using the stored API key
+5. Publishes to NuGet.org using a short-lived key from Trusted Publishing (OIDC)
 6. Skips duplicate packages if the same version already exists
 
 ### Package Contents
