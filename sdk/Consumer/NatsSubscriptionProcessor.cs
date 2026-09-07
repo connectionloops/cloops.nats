@@ -11,15 +11,6 @@ using System.Net;
 using System.Text.RegularExpressions;
 
 /// <summary>
-/// Exception thrown when message validation fails
-/// </summary>
-internal class MessageValidationException : Exception
-{
-    public MessageValidationException(string message) : base(message) { }
-    public MessageValidationException(string message, Exception innerException) : base(message, innerException) { }
-}
-
-/// <summary>
 /// The Processor class thats sets up subcription and processor of incoming messages
 /// </summary>
 internal class NatsSubscriptionProcessor
@@ -67,12 +58,6 @@ internal class NatsSubscriptionProcessor
 
     // Per-subject compiled invocation plans, built once during Setup.
     private readonly Dictionary<string, NatsConsumerInvocationPlan> plans = new();
-
-    // Cache for Validate() method per payload type to avoid reflection overhead
-    private readonly Dictionary<Type, MethodInfo?> ValidateMethodCache = new();
-
-    // Cache for Data property getter per message wrapper type to avoid reflection overhead
-    private readonly Dictionary<Type, PropertyInfo?> DataPropertyCache = new();
 
     private NatsSubjectMatcher? subjectMatcher;
 
@@ -391,19 +376,6 @@ internal class NatsSubscriptionProcessor
                 {
                     await EnqueueHandlerInvocationAsync(m, plan, ct).ConfigureAwait(false);
                 }
-                catch (MessageValidationException ex)
-                {
-                    // Validation failed - terminate and discard the message (don't retry)
-                    try
-                    {
-                        await m.AckTerminateAsync(EffectiveAckOpts(null), cancellationToken: ct).ConfigureAwait(false);
-                    }
-                    catch (Exception ackEx)
-                    {
-                        logger.LogWarning(ackEx, "Failed to terminate message after validation failure for subject {Subject}", subject);
-                    }
-                    logger.LogError(ex, "Message validation failed for subject {Subject} with payload type {PayloadType}. Discarding message.", subject, plan.PayloadType.Name);
-                }
                 catch (Exception ex)
                 {
                     logger.LogError(ex, "Can't process message {Subject} with payload type {PayloadType}. Most likely the message is not of type {PayloadType}. Skipping the message {Message}",
@@ -422,11 +394,6 @@ internal class NatsSubscriptionProcessor
                 try
                 {
                     await EnqueueHandlerInvocationAsync(m, plan, ct).ConfigureAwait(false);
-                }
-                catch (MessageValidationException ex)
-                {
-                    // Validation failed - discard the message (no ack needed for core NATS)
-                    logger.LogError(ex, "Message validation failed for subject {Subject} with payload type {PayloadType}. Discarding message.", subject, plan.PayloadType.Name);
                 }
                 catch (Exception ex)
                 {
@@ -467,12 +434,11 @@ internal class NatsSubscriptionProcessor
         msgObject = interception.message;
         var rawData = rawMsg.Data;
 
-        // Validate message payload if it has a Validate() method
-        ValidateMessageOrThrow(msgObject, plan.PayloadType, plan.MatchedSubject);
-
         await queue.QueueBackgroundWorkItem(new WorkItem(plan.MatchedSubject, async token =>
         {
-            var ackResult = await NatsConsumerHandlerInvoker.InvokeAsync(
+            // Validation runs here rather than on the subscription loop so that a failure can reach
+            // the registered exception handlers and be acked like any other failed invocation.
+            var ackResult = await NatsConsumerHandlerInvoker.InvokeWithValidationAsync(
                 plan,
                 msgObject,
                 rawData,
@@ -480,6 +446,15 @@ internal class NatsSubscriptionProcessor
                 consumerExceptionHandlers,
                 logger,
                 token).ConfigureAwait(false);
+
+            if (ackResult is null)
+            {
+                // Validation failed and no exception handler claimed it. Terminate and discard, as
+                // the platform has always done: redelivering a payload that cannot become valid only
+                // burns the consumer. The failure is already logged by the invoker.
+                await rawMsg.AckTerminateAsync(EffectiveAckOpts(null), cancellationToken: token).ConfigureAwait(false);
+                return (WorkItemExecutionStatus.FAIL, false);
+            }
 
             if (ackResult.IsAcknowledged)
             {
@@ -527,12 +502,12 @@ internal class NatsSubscriptionProcessor
         msgObject = interception.message;
         var rawData = rawMsg.Data;
 
-        // Validate message payload if it has a Validate() method
-        ValidateMessageOrThrow(msgObject, plan.PayloadType, plan.MatchedSubject);
-
         await queue.QueueBackgroundWorkItem(new WorkItem(plan.MatchedSubject, async token =>
         {
-            var ackResult = await NatsConsumerHandlerInvoker.InvokeAsync(
+            // Validation runs here rather than on the subscription loop so that a failure can reach
+            // the registered exception handlers, which is the only way a request/reply caller can be
+            // answered instead of being left to time out.
+            var ackResult = await NatsConsumerHandlerInvoker.InvokeWithValidationAsync(
                 plan,
                 msgObject,
                 rawData,
@@ -540,6 +515,14 @@ internal class NatsSubscriptionProcessor
                 consumerExceptionHandlers,
                 logger,
                 token).ConfigureAwait(false);
+
+            if (ackResult is null)
+            {
+                // Validation failed and no exception handler claimed it. Core NATS has no ack, so
+                // the message is simply dropped, exactly as it was before - a requester still times
+                // out. The failure is already logged by the invoker.
+                return (WorkItemExecutionStatus.FAIL, false);
+            }
 
             if (ackResult.Reply != null && rawMsg.ReplyTo != null)
                 await rawMsg.ReplyAsync(ackResult.Reply, cancellationToken: token).ConfigureAwait(false);
@@ -844,80 +827,5 @@ internal class NatsSubscriptionProcessor
         return payloadType;
     }
 
-    /// <summary>
-    /// Gets or caches the Validate() method for a given payload type.
-    /// Returns null if the type doesn't have a Validate() method.
-    /// </summary>
-    private MethodInfo? GetValidateMethod(Type payloadType)
-    {
-        if (ValidateMethodCache.TryGetValue(payloadType, out var cachedMethod))
-        {
-            return cachedMethod;
-        }
-
-        // Look for a public instance method named "Validate" with no parameters
-        var validateMethod = payloadType.GetMethod("Validate", BindingFlags.Public | BindingFlags.Instance, null, Type.EmptyTypes, null);
-        ValidateMethodCache[payloadType] = validateMethod;
-        return validateMethod;
-    }
-
-    /// <summary>
-    /// Gets or caches the Data property for a given message wrapper type.
-    /// Returns null if the type doesn't have a Data property.
-    /// </summary>
-    private PropertyInfo? GetDataProperty(Type msgWrapperType)
-    {
-        if (DataPropertyCache.TryGetValue(msgWrapperType, out var cachedProperty))
-        {
-            return cachedProperty;
-        }
-
-        var dataProperty = msgWrapperType.GetProperty("Data");
-        DataPropertyCache[msgWrapperType] = dataProperty;
-        return dataProperty;
-    }
-
-    /// <summary>
-    /// Validates a message payload if it has a Validate() method.
-    /// Throws <see cref="MessageValidationException"/> if validation fails.
-    /// Does nothing if no validation method exists.
-    /// </summary>
-    /// <exception cref="MessageValidationException">Thrown when validation fails.</exception>
-    private void ValidateMessageOrThrow(object msgObject, Type payloadType, string subject)
-    {
-        var validateMethod = GetValidateMethod(payloadType);
-        if (validateMethod == null)
-        {
-            // No Validate() method - skip validation
-            return;
-        }
-
-        try
-        {
-            // Extract the payload from NatsMsg<T> - it's the Data property
-            var msgWrapperType = msgObject.GetType();
-            var dataProperty = GetDataProperty(msgWrapperType);
-            if (dataProperty == null)
-            {
-                logger.LogWarning("Message wrapper for subject {Subject} does not have a Data property", subject);
-                return; // Can't validate, but don't block processing
-            }
-
-            var payload = dataProperty.GetValue(msgObject);
-            if (payload == null)
-            {
-                // Null payload - skip validation
-                return;
-            }
-
-            // Call Validate() on the payload
-            validateMethod.Invoke(payload, null);
-        }
-        catch (Exception ex)
-        {
-            // Validation failed - throw exception to be handled by parent
-            throw new MessageValidationException($"Message validation failed for subject {subject} with payload type {payloadType.Name}.", ex);
-        }
-    }
     #endregion
 }

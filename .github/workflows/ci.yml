@@ -9,7 +9,7 @@ env:
   PROJECT: sdk/cloops.nats.sdk.csproj
   BUILD_CONFIGURATION: Release
   MAJOR: 1
-  MINOR: 2
+  MINOR: 3
 
 jobs:
   build:
