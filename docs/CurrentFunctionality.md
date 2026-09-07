@@ -10,6 +10,7 @@ Quick navigation to key features:
 - [Available Features](#️-available-features)
   - [Message Subscription & Consumption](#-message-subscription--consumption)
   - [JetStream Durable Consumers](#-jetstream-durable-consumers)
+  - [Runtime (Dynamic) Consumer Registration](#-runtime-dynamic-consumer-registration)
   - [High-Performance Processing](#-high-performance-processing)
   - [Distributed Locking](#-distributed-locking)
   - [Queue Groups Implementation](#-queue-groups-implementation)
@@ -108,6 +109,90 @@ public async Task<NatsAck> ProcessDurableEffect(NatsMsg<EffectTriggered> msg, Ca
 }
 ```
 
+### 🧩 Runtime (Dynamic) Consumer Registration
+
+**Purpose**: Bind consumers whose subjects / durable consumer ids are only known at runtime.
+
+`[NatsConsumer]` is not `AllowMultiple` and its values are compile-time constants, so it cannot express
+_"one handler, N durable consumers"_. When the set of durables is owned by the control plane and changes
+over time (for example a stream that is re-sharded into lanes), the service can discover them at startup
+and register them itself.
+
+**Key Features**:
+
+- **Same code path**: dynamic consumers are validated, multiplexed per consumer id, intercepted, metered
+  and acked exactly like attribute declared ones. Nothing about the runtime behaviour differs.
+- **Fails loudly**: `NatsDynamicConsumer` validates the handler contract
+  (`Task<NatsAck> H(NatsMsg<T> msg, CancellationToken ct = default)`) in its constructor, so a bad binding
+  throws where you create it instead of at subscribe time.
+- **Async discovery**: `INatsDynamicConsumerSource.GetConsumersAsync` is awaited, so a source can query
+  JetStream for the durables that currently exist before deciding what to bind.
+- **Opt-in**: with no source registered and no argument passed, discovery is unchanged.
+
+**Registration (preferred)** — register a source before the host starts; it is resolved and awaited once,
+when consumers are mapped:
+
+```csharp
+// Program.cs, before RunAsync()
+app.builder.Services.AddSingleton<LaneConsumer>();
+app.builder.Services.AddNatsDynamicConsumerSource<LaneDiscoverySource>();
+```
+
+```csharp
+public class LaneDiscoverySource(ICloopsNatsClient nats) : INatsDynamicConsumerSource
+{
+    public async ValueTask<IReadOnlyCollection<NatsDynamicConsumer>> GetConsumersAsync(CancellationToken ct = default)
+    {
+        var handler = typeof(LaneConsumer).GetMethod(nameof(LaneConsumer.Handle))!;
+        var consumers = new List<NatsDynamicConsumer>();
+
+        // durables are created in the control plane; discover the ones that exist right now
+        await foreach (var name in nats.JsContext.ListConsumerNamesAsync("CBB_WORK", ct))
+        {
+            if (!name.StartsWith("cbb-lane-", StringComparison.Ordinal)) continue;
+            consumers.Add(new NatsDynamicConsumer(
+                subject: $"cbb.work.{name["cbb-lane-".Length..]}.>",
+                handlerType: typeof(LaneConsumer),
+                handlerMethod: handler,
+                consumerId: name));
+        }
+
+        return consumers;
+    }
+}
+```
+
+The handler class is resolved from DI (`GetRequiredService`), so it must be registered like any other
+consumer class. Consumers can also be passed straight to `MapConsumers(..., dynamicConsumers: [...])`
+when the caller owns the lifecycle.
+
+**Discovery is bounded**: subscriptions only start once every source has returned, so a source that hangs
+would stall **all** consumers - including attribute declared ones - while the pod still reports healthy and
+ready. Each source therefore gets a budget of **30 seconds**
+(`NATS_DYNAMIC_CONSUMER_DISCOVERY_TIMEOUT_SECONDS`, `0` disables it). On expiry the SDK logs `Critical` and
+throws `TimeoutException` - a crash-loop is visible, a silently idle pod is not. The budget is raced against
+the call rather than merely signalled through the cancellation token, so it bounds a source that ignores its
+token too; honour the token anyway, since an abandoned discovery task keeps running until the process exits.
+
+**Limits**:
+
+- A subject can only be bound once per process. Two lanes must have distinct subject filters.
+- Queue groups are core-subscription only. Passing one together with a consumer id throws: the attribute
+  discards it on the durable branch and the processor only reads it on the core path, so honouring it is
+  impossible and silently accepting it would mislead.
+- Registration happens once, when consumers are mapped. Lane membership changes are picked up on the next
+  restart - which is what the control-plane lane-split runbook expects.
+- Durable consumers must already exist; the SDK attaches, it never creates.
+
+**Duplicate subject handling** - the two paths differ, and the attribute path behaviour is pre-existing:
+
+| Path | `throwOnDuplicate: true` | `throwOnDuplicate: false` |
+| --- | --- | --- |
+| `[NatsConsumer]` attribute | `Environment.FailFast` - the process is killed | ⚠️ the duplicate is **not** ignored. Same consumer id -> `ArgumentException: An item with the same key has already been added`. Different consumer ids -> the subject is **silently bound twice** and every message is delivered to both handlers |
+| `NatsDynamicConsumer` | `InvalidOperationException` - it throws rather than `FailFast`, since runtime registrations come from application code | the duplicate registration is skipped |
+
+Do not rely on `throwOnDuplicate: false` to deduplicate attribute declared consumers; it does not.
+
 ### ⚡ High-Performance Processing
 
 **Purpose**: Optimized message processing with configurable parallelism and backpressure control.
@@ -125,9 +210,19 @@ The SDK supports high-performance processing through environment variables (see 
 - **`NATS_CONSUMER_MAX_DOP`**: Maximum degree of parallelism (default: 128)
   - Controls how many messages can be processed concurrently
   - Higher values increase throughput but require more CPU/memory
-- **`NATS_SUBSCRIPTION_QUEUE_SIZE`**: Maximum queue capacity per subscription (default: 20,000)
+- **`NATS_SUBSCRIPTION_QUEUE_SIZE`**: Maximum queue capacity per subscription (default: 2 × `NATS_CONSUMER_MAX_DOP`, i.e. 256 with the default DOP)
   - Controls backpressure when processing is slower than message arrival
   - When full, the SDK applies backpressure to prevent memory overflow
+  - The default is deliberately tied to the worker pool: every queued message waits roughly `depth × avg handler time / MaxDOP` before it is even started, and once that exceeds the consumer's `AckWait` the server redelivers messages that are still sitting in memory
+- **`NATS_CONSUMER_DOUBLE_ACK`**: Ask the server to confirm JetStream acks (default: `true`)
+  - With double-ack, awaiting an ack/nak/terminate completes only after the server confirms it recorded it, closing the window where a crash right after the handler completes loses the ack and the message is processed again after `AckWait`
+  - Costs one extra round trip per message, paid inside the parallel worker pool; set to `false` to restore fire-and-forget acks
+  - A handler that sets `AckOpts.DoubleAck` on its returned `NatsAck` always wins over this default
+
+**Ordering**: messages are pulled from the subscription in delivery order, but they are *processed* by up
+to `NATS_CONSUMER_MAX_DOP` workers concurrently, so processing/completion order is **not** guaranteed
+(redeliveries reorder things further). If strict per-message ordering matters for a consumer, it needs
+`NATS_CONSUMER_MAX_DOP=1` (or ordering by design, e.g. idempotent/commutative handlers).
 
 **Example Consumer**:
 

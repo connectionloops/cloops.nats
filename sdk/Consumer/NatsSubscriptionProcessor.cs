@@ -45,6 +45,19 @@ internal class NatsSubscriptionProcessor
     private readonly List<string> Subjects;
     private readonly int MaxDOP = 128;
 
+    /// <summary>
+    /// Capacity of the in-memory work queue between the subscription and the workers.
+    /// Defaults to 2 x <see cref="MaxDOP"/>; override with <c>NATS_SUBSCRIPTION_QUEUE_SIZE</c>.
+    /// </summary>
+    internal int QueueCapacity { get; }
+
+    /// <summary>
+    /// When true (the default), JetStream ack / nak / terminate calls that the handler did not
+    /// configure explicitly are sent with <c>DoubleAck</c>, i.e. they wait for the server to confirm
+    /// it recorded the ack. Disable with <c>NATS_CONSUMER_DOUBLE_ACK=false</c>.
+    /// </summary>
+    internal bool DoubleAckByDefault { get; }
+
     private bool UseBatching = false;
     private int BatchTimeoutMs = 100;
 
@@ -104,14 +117,43 @@ internal class NatsSubscriptionProcessor
         consumerInterceptors = sp.GetServices<INatsConsumerInterceptor>().ToArray();
         consumerExceptionHandlers = sp.GetServices<INatsConsumerExceptionHandler>().ToArray();
 
-        queue = new NatsSubscriptionQueue(int.TryParse(Environment.GetEnvironmentVariable("NATS_SUBSCRIPTION_QUEUE_SIZE"), out int queueSize) ? queueSize : 20000);
         MaxDOP = int.TryParse(Environment.GetEnvironmentVariable("NATS_CONSUMER_MAX_DOP"), out int _maxDop) ? _maxDop : 128;
+
+        // The queue only exists to keep the workers fed between batch reads, so it is sized relative
+        // to the worker pool rather than as a large absolute number. A deep queue silently adds
+        // delivery-to-ack latency (depth x avg handler time / MaxDOP) and once that exceeds the
+        // consumer's AckWait the server redelivers messages that are still waiting in memory.
+        QueueCapacity = int.TryParse(Environment.GetEnvironmentVariable("NATS_SUBSCRIPTION_QUEUE_SIZE"), out int queueSize) ? queueSize : MaxDOP * 2;
+        queue = new NatsSubscriptionQueue(QueueCapacity);
         _concurrencyLimiter = new SemaphoreSlim(MaxDOP, MaxDOP);
         consumerId = _consumerId;
+
+        // Double-ack by default: without it, awaiting an ack only means it reached the client's send
+        // buffer, so a crash or dropped connection right after a handler completes loses the ack and
+        // the message is processed again after AckWait. DoubleAck asks the server to confirm it
+        // recorded the ack, at the cost of one round trip per message (paid inside the parallel
+        // worker pool). A handler that sets AckOpts.DoubleAck itself always wins.
+        DoubleAckByDefault = !bool.TryParse(Environment.GetEnvironmentVariable("NATS_CONSUMER_DOUBLE_ACK"), out bool doubleAck) || doubleAck;
 
     }
 
     #region bootstreap
+
+    /// <summary>
+    /// The consumer id this processor subscribes with.
+    /// </summary>
+    internal string RegisteredConsumerId => consumerId;
+
+    /// <summary>
+    /// Subjects bound to this processor, in registration order.
+    /// </summary>
+    internal IReadOnlyList<string> RegisteredSubjects => Subjects;
+
+    /// <summary>
+    /// Handler method bound to each subject.
+    /// </summary>
+    internal IReadOnlyDictionary<string, MethodInfo> RegisteredHandlers => handler;
+
     public void AddSubject(string subject, NatsConsumerAttribute _nca, Type _handlerClassType, MethodInfo _handler)
     {
         nca.Add(subject, _nca);
@@ -133,6 +175,36 @@ internal class NatsSubscriptionProcessor
         UseBatching = _UseBatching;
         BatchTimeoutMs = _BatchTimeoutMs;
     }
+    /// <summary>
+    /// Validates every bound handler signature and compiles its invoker.
+    /// </summary>
+    /// <remarks>
+    /// Split out of <see cref="Setup"/> so the binding can be validated and exercised without opening a
+    /// NATS subscription. Throws for any handler that does not match the consumer contract.
+    /// </remarks>
+    internal void BuildInvocationPlans()
+    {
+        // validation
+        foreach (string subject in Subjects)
+        {
+            // populates cache and performs validations.
+            var payloadType = GetPayloadType(subject);
+
+            // Compile the handler invoker once, after the signature has been validated.
+            plans[subject] = new NatsConsumerInvocationPlan(
+                subject,
+                payloadType,
+                handlerClassType[subject],
+                handler[subject],
+                handlerClassInstance[subject]);
+        }
+    }
+
+    /// <summary>
+    /// The compiled invocation plan bound to a subject. Call <see cref="BuildInvocationPlans"/> first.
+    /// </summary>
+    internal NatsConsumerInvocationPlan GetInvocationPlan(string subject) => plans[subject];
+
     #endregion bootstrap
 
     #region setup
@@ -152,20 +224,7 @@ internal class NatsSubscriptionProcessor
     /// </remarks>
     internal async Task Setup(CancellationToken ct)
     {
-        // validation
-        foreach (string subject in Subjects)
-        {
-            // populates cache and performs validations.
-            var payloadType = GetPayloadType(subject);
-
-            // Compile the handler invoker once, after the signature has been validated.
-            plans[subject] = new NatsConsumerInvocationPlan(
-                subject,
-                payloadType,
-                handlerClassType[subject],
-                handler[subject],
-                handlerClassInstance[subject]);
-        }
+        BuildInvocationPlans();
 
         // subject matcher
         subjectMatcher = new NatsSubjectMatcher(Subjects);
@@ -337,7 +396,7 @@ internal class NatsSubscriptionProcessor
                     // Validation failed - terminate and discard the message (don't retry)
                     try
                     {
-                        await m.AckTerminateAsync(cancellationToken: ct).ConfigureAwait(false);
+                        await m.AckTerminateAsync(EffectiveAckOpts(null), cancellationToken: ct).ConfigureAwait(false);
                     }
                     catch (Exception ackEx)
                     {
@@ -424,7 +483,7 @@ internal class NatsSubscriptionProcessor
 
             if (ackResult.IsAcknowledged)
             {
-                await rawMsg.AckAsync(ackResult.Opts, cancellationToken: token).ConfigureAwait(false);
+                await rawMsg.AckAsync(EffectiveAckOpts(ackResult.Opts), cancellationToken: token).ConfigureAwait(false);
 
                 // An exception handler chose to ack, but the invocation still failed. Apply the ack
                 // it asked for while reporting the failure so error rates stay accurate.
@@ -432,12 +491,12 @@ internal class NatsSubscriptionProcessor
             }
             else if (!ackResult.ShouldRetryDelivery)
             {
-                await rawMsg.AckTerminateAsync(ackResult.Opts, cancellationToken: token).ConfigureAwait(false);
+                await rawMsg.AckTerminateAsync(EffectiveAckOpts(ackResult.Opts), cancellationToken: token).ConfigureAwait(false);
                 return (WorkItemExecutionStatus.FAIL, false);
             }
             else
             {
-                await rawMsg.NakAsync(ackResult.Opts, cancellationToken: token).ConfigureAwait(false);
+                await rawMsg.NakAsync(EffectiveAckOpts(ackResult.Opts), cancellationToken: token).ConfigureAwait(false);
                 return (WorkItemExecutionStatus.FAIL, true);
             }
         }
@@ -537,11 +596,11 @@ internal class NatsSubscriptionProcessor
         // JetStream rejects only affect delivery/ack semantics. Optional Reply is ignored here.
         if (result.ShouldRetryDelivery)
         {
-            await rawMsg.NakAsync(cancellationToken: ct).ConfigureAwait(false);
+            await rawMsg.NakAsync(EffectiveAckOpts(null), cancellationToken: ct).ConfigureAwait(false);
             return;
         }
 
-        await rawMsg.AckTerminateAsync(cancellationToken: ct).ConfigureAwait(false);
+        await rawMsg.AckTerminateAsync(EffectiveAckOpts(null), cancellationToken: ct).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -615,6 +674,25 @@ internal class NatsSubscriptionProcessor
     #endregion
 
     #region utility-functions
+
+    /// <summary>
+    /// Applies the double-ack default to the options a handler returned (or to none at all).
+    /// </summary>
+    /// <remarks>
+    /// A handler that set <see cref="AckOpts.DoubleAck"/> explicitly - to true or to false - always
+    /// wins. Only when it left the decision open (no opts, or opts without <c>DoubleAck</c>) does the
+    /// processor-wide default apply. Used for every JetStream ack, nak and terminate this processor
+    /// sends; core NATS has no acks.
+    /// </remarks>
+    internal AckOpts? EffectiveAckOpts(AckOpts? opts)
+    {
+        if (opts?.DoubleAck is not null || !DoubleAckByDefault)
+        {
+            return opts;
+        }
+
+        return (opts ?? default) with { DoubleAck = true };
+    }
 
     /// <summary>
     /// Finds the first (and by policy, only) stream that captures the given subject and returns its name.
@@ -760,37 +838,10 @@ internal class NatsSubscriptionProcessor
         {
             throw new InvalidOperationException($"Can't find handler for subject {subject}");
         }
-        var parameters = _handler.GetParameters();
-        if (parameters.Length != 2)
-        {
-            throw new InvalidOperationException($"Invalid Handler: {_handler.Name} must have exactly 2 parameters: (NatsMsg<T> payload, CancellationToken).");
-        }
+        var payloadType = NatsConsumerHandlerSignature.GetPayloadType(_handler);
 
-        var messageType = parameters[0].ParameterType;
-        if (!messageType.IsGenericType || messageType.GetGenericTypeDefinition() != typeof(NatsMsg<>))
-        {
-            throw new InvalidOperationException($"Consumer method {_handler.Name} parameter[0] must be of type NatsMsg<T>.");
-        }
-
-        var messageGenericArguments = messageType.GetGenericArguments();
-        if (messageGenericArguments.Length != 1)
-        {
-            throw new InvalidOperationException($"Invalid Handler: {_handler.Name} must define exactly one generic type argument for its payload.");
-        }
-
-        // validate return type
-        var rt = _handler.ReturnType;
-        bool isReturnTypeValid =
-            rt.IsGenericType &&
-            rt.GetGenericTypeDefinition() == typeof(Task<>) &&
-            rt.GetGenericArguments()[0] == typeof(NatsAck);
-
-        if (!isReturnTypeValid)
-            throw new InvalidOperationException(
-                $"Handler {_handler.DeclaringType?.Name}.{_handler.Name} must return Task<NatsAck>.");
-
-        PayloadTypeCache[subject] = messageGenericArguments[0];
-        return messageGenericArguments[0];
+        PayloadTypeCache[subject] = payloadType;
+        return payloadType;
     }
 
     /// <summary>
