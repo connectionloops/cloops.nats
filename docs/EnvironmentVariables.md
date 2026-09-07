@@ -1,13 +1,19 @@
 # Environment Variables used by SDK
 
 - `NATS_SUBSCRIPTION_QUEUE_SIZE`
-  - This vaiable defines what should be the max limit of messages queued up for each subscription. Use this to control backpressure. Default: 20,000
+  - This vaiable defines what should be the max limit of messages queued up for each subscription. Use this to control backpressure. Default: 2 × `NATS_CONSUMER_MAX_DOP` (256 with the default DOP of 128)
   - If your processing is slow then messages pile up in the queue consuming memory. This gives you way to control memory growth.
   - It is also puts backpressure once the queue is full so as to not overload your application.
-  - Do not increase this blindly. First consider if you can make your message processing faster by either optimizing logic or doing things async.
+  - The default is tied to the worker pool on purpose: a queued message waits roughly `depth × avg handler time / MaxDOP` before a worker picks it up. With a deep queue that wait silently exceeds the consumer's `AckWait` and the server redelivers messages that are still in memory - duplicates with no visible failure anywhere.
+  - Do not increase this blindly. First consider if you can make your message processing faster by either optimizing logic or doing things async. If you do raise it, make sure `AckWait` on the consumer comfortably exceeds `queue size × avg handler time / MaxDOP`.
 - `NATS_CONSUMER_MAX_DOP`
   - Defines maximum degree of parallelism for all consumers. These many messages can be processed in parallel from the message queue. Default: 128
   - This puts upper limit on rps (request per second), not literally, but indirectly. e.g. if your avg latency to process a message is 200ms then max_dop \* 5 is your max throughput. Increase this in order to support higher rps. Consider giving higher core / memory count as well.
+- `NATS_CONSUMER_DOUBLE_ACK`
+  - When `true` (the default), JetStream acks, naks and terminates ask the server to confirm they were recorded (`DoubleAck`) before the await completes.
+  - Without it, awaiting an ack only means the ack reached the client's send buffer; a crash or dropped connection right after a handler completes loses the ack and the message is processed again after `AckWait`. Double-ack closes that window at the cost of one extra round trip per message (paid inside the parallel worker pool, so throughput impact is bounded).
+  - A handler that sets `AckOpts.DoubleAck` explicitly on its returned `NatsAck` always wins over this default. Set the variable to `false` to restore fire-and-forget acks everywhere.
+  - Handlers must stay idempotent either way: double-ack narrows the redelivery window, it does not create exactly-once processing.
 - `NATS_DYNAMIC_CONSUMER_DISCOVERY_TIMEOUT_SECONDS`
   - Per-source budget for `INatsDynamicConsumerSource.GetConsumersAsync`, which runs while consumers are being mapped. Default: 30
   - Subscriptions only start once every source has returned, so a source that hangs stalls *all* consumers - including attribute declared ones - while the pod still reports healthy and ready. On expiry the SDK logs `Critical` and throws `TimeoutException`.

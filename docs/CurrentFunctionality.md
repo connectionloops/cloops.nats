@@ -210,9 +210,19 @@ The SDK supports high-performance processing through environment variables (see 
 - **`NATS_CONSUMER_MAX_DOP`**: Maximum degree of parallelism (default: 128)
   - Controls how many messages can be processed concurrently
   - Higher values increase throughput but require more CPU/memory
-- **`NATS_SUBSCRIPTION_QUEUE_SIZE`**: Maximum queue capacity per subscription (default: 20,000)
+- **`NATS_SUBSCRIPTION_QUEUE_SIZE`**: Maximum queue capacity per subscription (default: 2 × `NATS_CONSUMER_MAX_DOP`, i.e. 256 with the default DOP)
   - Controls backpressure when processing is slower than message arrival
   - When full, the SDK applies backpressure to prevent memory overflow
+  - The default is deliberately tied to the worker pool: every queued message waits roughly `depth × avg handler time / MaxDOP` before it is even started, and once that exceeds the consumer's `AckWait` the server redelivers messages that are still sitting in memory
+- **`NATS_CONSUMER_DOUBLE_ACK`**: Ask the server to confirm JetStream acks (default: `true`)
+  - With double-ack, awaiting an ack/nak/terminate completes only after the server confirms it recorded it, closing the window where a crash right after the handler completes loses the ack and the message is processed again after `AckWait`
+  - Costs one extra round trip per message, paid inside the parallel worker pool; set to `false` to restore fire-and-forget acks
+  - A handler that sets `AckOpts.DoubleAck` on its returned `NatsAck` always wins over this default
+
+**Ordering**: messages are pulled from the subscription in delivery order, but they are *processed* by up
+to `NATS_CONSUMER_MAX_DOP` workers concurrently, so processing/completion order is **not** guaranteed
+(redeliveries reorder things further). If strict per-message ordering matters for a consumer, it needs
+`NATS_CONSUMER_MAX_DOP=1` (or ordering by design, e.g. idempotent/commutative handlers).
 
 **Example Consumer**:
 

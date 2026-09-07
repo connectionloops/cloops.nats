@@ -70,8 +70,12 @@ public interface ICloopsNatsClient : INatsClient
     /// A call that lands here runs none of the SDK's code, so if you implement
     /// <see cref="ICloopsNatsClient"/> yourself you must query <see cref="INatsDynamicConsumerSource"/> from
     /// <paramref name="sp"/> in <b>this</b> method - the default implementation of the five argument
-    /// overload cannot do it for you. Forwarding here to that overload, as
-    /// <see cref="CloopsNatsClient"/> does, is the simplest way to stay correct.
+    /// overload cannot do it for you. The correct pattern is the one <see cref="CloopsNatsClient"/> uses:
+    /// <b>override the five argument overload too</b>, and forward this method to your override.
+    /// Never forward this method into the five argument overload while relying on its default
+    /// implementation: when there is nothing dynamic to register, that default forwards straight back
+    /// to this method, and the two recurse until the stack overflows - even in an application that
+    /// uses no dynamic consumers at all.
     /// </para>
     /// </remarks>
     public Task MapConsumers(IServiceProvider sp, CancellationToken ct = default, string[]? assemblyNameFilters = null, bool throwOnDuplicate = true);
