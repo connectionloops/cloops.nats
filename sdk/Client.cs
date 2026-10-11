@@ -173,7 +173,16 @@ public class CloopsNatsClient : ICloopsNatsClient
     internal KvDistributedLock? Locker { get; set; }
 
     /// <summary>
-    /// Initializes a new instance of the <see cref="NatsClient"/> class.
+    /// The connection options this client was built with. Never null: a client constructed without an
+    /// options object reports <see cref="CloopsNatsClientOptions.Default"/>. Useful for logging the
+    /// effective configuration at startup; the applied values are on <c>Connection.Opts</c>.
+    /// </summary>
+    public CloopsNatsClientOptions Options { get; }
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="CloopsNatsClient"/> class with NATS.Net default
+    /// timeouts and no logging. See <see cref="CloopsNatsClient(string, string, string?, CloopsNatsClientOptions?)"/>
+    /// to configure timeouts and logging.
     /// </summary>
     /// <param name="url">NATS server URL to connect to. (default: nats://localhost:4222)</param>
     /// <param name="name">Client name. (default: NATS .NET Client)</param>
@@ -198,7 +207,64 @@ public class CloopsNatsClient : ICloopsNatsClient
         string url = "nats://dev.nats.cloops.in:4222",
         string name = "CLOOPS NATS .NET Client",
         string? creds = null)
+        : this(url, name, creds, options: null)
     {
+    }
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="CloopsNatsClient"/> class with explicit connection options.
+    /// </summary>
+    /// <param name="url">NATS server URL to connect to, see <see cref="CloopsNatsClient(string, string, string?)"/> for the accepted forms.</param>
+    /// <param name="name">Client name as reported to the server.</param>
+    /// <param name="creds">The content of the creds for NATS Connection, or null.</param>
+    /// <param name="options">
+    /// Timeouts, logging and an escape hatch for any other <see cref="NatsOpts"/> value. Null, or an
+    /// options object with every property unset, gives exactly the behaviour of the three argument constructor.
+    /// </param>
+    /// <remarks>
+    /// <para>
+    /// This is a separate overload rather than an optional parameter on the three argument constructor on
+    /// purpose: C# binds optional arguments at the call site, so adding one would remove the three argument
+    /// member reference and break already-compiled callers at runtime.
+    /// </para>
+    /// <para>
+    /// When <see cref="CloopsNatsClientOptions.LoggerFactory"/> is set it is handed to NATS.Net (making its
+    /// internal reconnect, ping and retry diagnostics visible) and, unless
+    /// <see cref="CloopsNatsClientOptions.LogConnectionEvents"/> is false, the connection lifecycle events are
+    /// logged under the <see cref="CloopsNatsClient"/> category.
+    /// </para>
+    /// </remarks>
+    /// <exception cref="ArgumentOutOfRangeException">A timeout is zero or negative (other than <see cref="Timeout.InfiniteTimeSpan"/>).</exception>
+    public CloopsNatsClient(
+        string url,
+        string name,
+        string? creds,
+        CloopsNatsClientOptions? options)
+    {
+        Options = options ?? CloopsNatsClientOptions.Default;
+
+        var opts = BuildNatsOpts(url, name, creds, Options);
+        Connection = new NatsConnection(opts);
+        JsContext = Connection.CreateJetStreamContext();
+        KvContext = Connection.CreateKeyValueStoreContext();
+
+        if (Options.LoggerFactory is not null && Options.LogConnectionEvents)
+        {
+            SubscribeConnectionEventLogging(Connection, Options.LoggerFactory.CreateLogger<CloopsNatsClient>());
+        }
+    }
+
+    /// <summary>
+    /// Builds the <see cref="NatsOpts"/> for a connection: the values the client has always used, overlaid
+    /// with whatever <paramref name="options"/> sets, with <see cref="CloopsNatsClientOptions.Configure"/>
+    /// applied last.
+    /// </summary>
+    internal static NatsOpts BuildNatsOpts(string url, string name, string? creds, CloopsNatsClientOptions options)
+    {
+        ValidateTimeout(options.RequestTimeout, nameof(options.RequestTimeout));
+        ValidateTimeout(options.CommandTimeout, nameof(options.CommandTimeout));
+        ValidateTimeout(options.ConnectTimeout, nameof(options.ConnectTimeout));
+
         var opts = new NatsOpts
         {
             Name = name,
@@ -207,9 +273,84 @@ public class CloopsNatsClient : ICloopsNatsClient
             SubPendingChannelFullMode = BoundedChannelFullMode.Wait,
             AuthOpts = new NatsAuthOpts { Creds = creds },
         };
-        Connection = new NatsConnection(opts);
-        JsContext = Connection.CreateJetStreamContext();
-        KvContext = Connection.CreateKeyValueStoreContext();
+
+        // Only override what the caller set, so an unset property keeps the NATS.Net default.
+        if (options.RequestTimeout is { } requestTimeout)
+        {
+            opts = opts with { RequestTimeout = requestTimeout };
+        }
+
+        if (options.CommandTimeout is { } commandTimeout)
+        {
+            opts = opts with { CommandTimeout = commandTimeout };
+        }
+
+        if (options.ConnectTimeout is { } connectTimeout)
+        {
+            opts = opts with { ConnectTimeout = connectTimeout };
+        }
+
+        if (options.LoggerFactory is { } loggerFactory)
+        {
+            opts = opts with { LoggerFactory = loggerFactory };
+        }
+
+        // Escape hatch runs last so it can see, and override, everything above.
+        opts = options.Configure?.Invoke(opts) ?? opts;
+
+        return opts;
+
+        static void ValidateTimeout(TimeSpan? value, string propertyName)
+        {
+            if (value is { } timeout && timeout <= TimeSpan.Zero && timeout != Timeout.InfiniteTimeSpan)
+            {
+                throw new ArgumentOutOfRangeException(
+                    $"{nameof(CloopsNatsClientOptions)}.{propertyName}",
+                    timeout,
+                    "Timeout must be greater than zero or Timeout.InfiniteTimeSpan.");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Logs the connection lifecycle events. These are the signals that explain a
+    /// <c>NatsJSPublishNoResponseException</c> or a stalled consumer after the fact, and NATS.Net does not
+    /// log them itself.
+    /// </summary>
+    private static void SubscribeConnectionEventLogging(INatsConnection connection, ILogger logger)
+    {
+        connection.ConnectionOpened += (_, e) =>
+        {
+            logger.LogInformation("NATS connection opened to server {NatsServer}: {Message}", ServerName(connection), e.Message);
+            return default;
+        };
+
+        connection.ConnectionDisconnected += (_, e) =>
+        {
+            logger.LogWarning("NATS connection disconnected from server {NatsServer}: {Message}", ServerName(connection), e.Message);
+            return default;
+        };
+
+        connection.ReconnectFailed += (_, e) =>
+        {
+            logger.LogWarning("NATS reconnect attempt failed (last server {NatsServer}): {Message}", ServerName(connection), e.Message);
+            return default;
+        };
+
+        connection.MessageDropped += (_, e) =>
+        {
+            logger.LogWarning("NATS message dropped on subject {Subject} with {Pending} pending messages (server {NatsServer}); the subscription's pending channel is full", e.Subject, e.Pending, ServerName(connection));
+            return default;
+        };
+
+        connection.LameDuckModeActivated += (_, e) =>
+        {
+            logger.LogWarning("NATS server {NatsServer} at {Uri} entered lame duck mode; expect a reconnect", ServerName(connection), e.Uri);
+            return default;
+        };
+
+        static string ServerName(INatsConnection connection)
+            => connection.ServerInfo?.Name is { Length: > 0 } serverName ? serverName : "(unknown)";
     }
 
     /// <inheritdoc />
