@@ -118,6 +118,17 @@ logger.LogInformation("NATS RequestTimeout={Timeout}", cnc.Connection.Opts.Reque
 
 Every property is optional and an unset property keeps the NATS.Net default, so existing callers using the three argument constructor are unchanged. With a `LoggerFactory` set (directly or through `Configure`) the client also logs the connection lifecycle events (`ConnectionOpened`, `ConnectionDisconnected`, `ReconnectFailed`, `MessageDropped`, `LameDuckModeActivated`) under the `CLOOPS.NATS.CloopsNatsClient` category; set `LogConnectionEvents = false` if you subscribe to them yourself. The client sets `SubPendingChannelFullMode = Wait`, so a full subscription channel applies backpressure instead of dropping messages and `MessageDropped` will rarely if ever fire under normal operation. The effective options are exposed as `cnc.Options`.
 
+## Upgrading to 2.x (NATS.Net 3.x)
+
+cloops.nats 2.x depends on NATS.Net 3.3 (every `NATS.Client.*` package on the same 3.x line). 1.x depended on NATS.Net 2.6, and a service that also referenced a NATS.Net 3.x package (for example `NATS.Client.OpenTelemetry`) ended up with a mixed graph that fails at runtime (`MissingMethodException` from ordered consumers). The cloops.nats API itself is unchanged, but the NATS.Net types it exposes (`Connection`, `JsContext`, `KvContext`, `NatsOpts` in `Configure`) now follow NATS.Net 3.x:
+
+- JetStream `ConsumeAsync` / `FetchAsync` / `NextAsync` yield `INatsJSMsg<T>` instead of `NatsJSMsg<T>`. Code using `var` compiles unchanged; code naming `NatsJSMsg<T>` must switch to `INatsJSMsg<T>`.
+- Request-reply defaults to `NatsRequestReplyMode.Direct`, and the default subscription pending capacity is 16384 (was 1024). cloops.nats still sets `SubPendingChannelFullMode = Wait`.
+- Classes that implement `INatsJSContext`, `INatsJSStream`, `INatsJSConsumer` or `INatsSvcServer` themselves (test doubles) must implement the members NATS.Net 3.2 / 3.3 added.
+- Any other `NATS.Client.*` package the service references directly must move to 3.x as well; prefer the same version as cloops.nats (3.3.0).
+
+See the [NATS.Net 3.0 release notes](https://github.com/nats-io/nats.net/releases/tag/v3.0.0) for the full list.
+
 ## Learn More
 
 - 📖 **[Examples](./examples)** - See real-world usage patterns

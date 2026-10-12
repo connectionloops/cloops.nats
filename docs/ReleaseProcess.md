@@ -44,8 +44,8 @@ The version follows the semantic versioning pattern: `MAJOR.MINOR.BUILD`
 
 Where:
 
-- **MAJOR**: Defined in workflow env as `MAJOR` (currently `1`)
-- **MINOR**: Defined in workflow env as `MINOR` (currently `1`)
+- **MAJOR**: Defined in workflow env as `MAJOR` (currently `2`)
+- **MINOR**: Defined in workflow env as `MINOR` (currently `0`)
 - **BUILD**: Automatically set to `github.run_number` (GitHub Actions run number)
 
 **Example**: If `MAJOR=1`, `MINOR=1`, and the workflow run number is `42`, the resulting version will be `1.1.42`.

@@ -413,7 +413,7 @@ internal class NatsSubscriptionProcessor
     /// Note: only one subscription exists per consumer id, so multiple subjects are handled by the same subscription.
     /// This is why we need to use the subject to get the handler and handler class instance.
     /// </summary>
-    private async ValueTask EnqueueHandlerInvocationAsync(NatsJSMsg<byte[]> rawMsg, NatsConsumerInvocationPlan plan, CancellationToken ct)
+    private async ValueTask EnqueueHandlerInvocationAsync(INatsJSMsg<byte[]> rawMsg, NatsConsumerInvocationPlan plan, CancellationToken ct)
     {
         var msgObject = BaseNatsUtil.CreateTypedMsgWrapper(rawMsg, plan.PayloadType);
         var jetStream = NatsConsumerJetStreamMetadata.From(rawMsg);
@@ -569,7 +569,7 @@ internal class NatsSubscriptionProcessor
     /// Rejects a JetStream message according to the interceptor result.
     /// </summary>
     private async Task RejectJetStreamMessageAsync(
-        NatsJSMsg<byte[]> rawMsg,
+        INatsJSMsg<byte[]> rawMsg,
         string subject,
         NatsConsumerInterceptorResult result,
         CancellationToken ct)
@@ -699,7 +699,7 @@ internal class NatsSubscriptionProcessor
     /// <summary>
     /// Durable JetStream subscription (resolves stream via subject lookup, control plane owns consumer).
     /// </summary>
-    private async Task<IAsyncEnumerable<NatsJSMsg<byte[]>>> GetJsSubscriptionAsync(CancellationToken ct)
+    private async Task<IAsyncEnumerable<INatsJSMsg<byte[]>>> GetJsSubscriptionAsync(CancellationToken ct)
     {
         HashSet<string> matchingStreamNames = new();
         foreach (string s in Subjects)
