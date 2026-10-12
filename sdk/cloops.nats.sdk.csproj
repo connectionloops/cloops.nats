@@ -5,7 +5,8 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
-    <Version>1.0.0</Version>
+    <!-- Local default only; CI passes -p:Version=MAJOR.MINOR.PATCH (see .github/workflows/ci.yml). -->
+    <Version>2.0.0</Version>
   </PropertyGroup>
 
 
