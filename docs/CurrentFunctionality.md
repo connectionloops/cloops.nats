@@ -683,7 +683,7 @@ await subject.StreamPublish(new EffectTriggered { Id = "123" }, dedupeId: "uniqu
 
 - **`Util.cs`** / **`BaseNatsUtil`**: Type conversion utilities for NatsMsg processing and JSON serialization
 - **`CloopsSerializer.cs`**: Custom serializer implementation with camelCase naming and flexible number handling
-- **Method overloading**: Handles both `NatsMsg<byte[]>` and `NatsJSMsg<byte[]>` message types
+- **Method overloading**: Handles both `NatsMsg<byte[]>` and `INatsJSMsg<byte[]>` message types
 
 **Infrastructure Services**:
 

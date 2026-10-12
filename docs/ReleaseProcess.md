@@ -40,15 +40,17 @@ Version management is completely controlled by GitHub Actions workflow environme
 
 ### Version Format
 
-The version follows the semantic versioning pattern: `MAJOR.MINOR.BUILD`
+The version follows the semantic versioning pattern: `MAJOR.MINOR.PATCH`
 
 Where:
 
-- **MAJOR**: Defined in workflow env as `MAJOR` (currently `1`)
-- **MINOR**: Defined in workflow env as `MINOR` (currently `1`)
-- **BUILD**: Automatically set to `github.run_number` (GitHub Actions run number)
+- **MAJOR**: Defined in workflow env as `MAJOR` (currently `2`)
+- **MINOR**: Defined in workflow env as `MINOR` (currently `0`)
+- **PATCH**: Calculated by the build job: the highest existing `v{MAJOR}.{MINOR}.*` tag plus one, or `0` when no tag exists for that `MAJOR.MINOR` yet
 
-**Example**: If `MAJOR=1`, `MINOR=1`, and the workflow run number is `42`, the resulting version will be `1.1.42`.
+**Example**: With `MAJOR=2`, `MINOR=0` and no `v2.0.*` tag, the first release is `2.0.0`, the next `2.0.1`, and so on. Bumping `MINOR` to `1` starts again at `2.1.0`.
+
+Up to 1.4 the third component was the GitHub Actions run number, which never resets (last 1.x release: `1.4.13`). Runs are serialized (`concurrency` in `ci.yml`) so two quick merges cannot compute the same version, and the publish job reuses the build job's version so package, tag and release always agree.
 
 ### Version Components
 
@@ -56,16 +58,17 @@ Where:
 | --------- | ------------------------- | ------------------------------------------------------- |
 | **Major** | Major version number      | Manual update in `.github/workflows/ci.yml` env section |
 | **Minor** | Minor version number      | Manual update in `.github/workflows/ci.yml` env section |
-| **Build** | GitHub Actions run number | Automatic (increments with each workflow run)           |
+| **Patch** | Next free patch for `MAJOR.MINOR` | Automatic (from existing `v{MAJOR}.{MINOR}.*` tags)     |
 
 ### Updating Version
 
 To update the major or minor version:
 
 1. Edit `.github/workflows/ci.yml`
-2. Update the `MAJOR` or `MINOR` values in the `env` section (lines 11-12)
-3. Commit and push to `main`
-4. The next workflow run will use the new version numbers
+2. Update the `MAJOR` or `MINOR` values in the `env` section; the patch restarts at `0` automatically
+3. Add a `CHANGELOG.md` entry naming the new version
+4. Commit and push to `main`
+5. The next workflow run will use the new version numbers
 
 > As a philosophy, all events, messages and subjects are always backward compatible. A new SDK version always \*adds\*\* new events, messages never modifies existing events and messages, unless deprecation is authorized confirming absolutely no one is using old payload
 
@@ -108,7 +111,7 @@ Each published package includes:
 
 After successfully publishing to NuGet, the workflow automatically:
 
-1. Creates a Git tag in the format `v{version}` (e.g., `v1.1.42`)
+1. Creates a Git tag in the format `v{version}` (e.g., `v2.0.0`)
 2. Tags the commit that triggered the workflow
 3. Skips tag creation if the tag already exists (idempotent)
 

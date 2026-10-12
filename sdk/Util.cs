@@ -79,7 +79,7 @@ public class BaseNatsUtil
     /// <param name="originalMsg">The original JetStream NATS message</param>
     /// <param name="payloadType">The type of the payload</param>
     /// <returns>Typed NATS message instance</returns>
-    internal static object CreateTypedMsgWrapper(NatsJSMsg<byte[]> originalMsg, Type payloadType)
+    internal static object CreateTypedMsgWrapper(INatsJSMsg<byte[]> originalMsg, Type payloadType)
     {
         var payload = Deserialize(originalMsg.Data, payloadType);
 

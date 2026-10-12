@@ -5,16 +5,23 @@ on:
     branches:
       - main
 
+# Runs are serialized so two quick merges cannot compute the same version (see "Calculate package version").
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   PROJECT: sdk/cloops.nats.sdk.csproj
   BUILD_CONFIGURATION: Release
-  MAJOR: 1
-  MINOR: 4
+  MAJOR: 2
+  MINOR: 0
 
 jobs:
   build:
     name: Build and Test
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.PACKAGE_VERSION }}
     # A hung consumer-discovery test would otherwise burn the 6h default job limit instead of going red.
     timeout-minutes: 15
 
@@ -27,10 +34,18 @@ jobs:
         with:
           dotnet-version: "9.0.x"
 
+      # PATCH = highest existing v{MAJOR}.{MINOR}.* tag + 1, or 0 for a new MAJOR.MINOR line,
+      # so bumping MAJOR or MINOR starts at .0 (2.0.0, 2.0.1, ...). Up to 1.4 the patch was the
+      # workflow run number, which never resets.
       - name: Calculate package version
         id: version
         run: |
-          VERSION="${{ env.MAJOR }}.${{ env.MINOR }}.${{ github.run_number }}"
+          PREFIX="${{ env.MAJOR }}.${{ env.MINOR }}"
+          LAST=$(git ls-remote --tags --refs origin "refs/tags/v${PREFIX}.*" \
+            | sed -E "s|.*refs/tags/v${PREFIX//./\\.}\.||" \
+            | grep -E '^[0-9]+$' | sort -n | tail -1)
+          if [ -z "$LAST" ]; then PATCH=0; else PATCH=$((LAST + 1)); fi
+          VERSION="${PREFIX}.${PATCH}"
           echo "PACKAGE_VERSION=$VERSION" >> $GITHUB_OUTPUT
           echo "Package version: $VERSION"
 
@@ -40,7 +55,15 @@ jobs:
       - name: Build project
         run: dotnet build ${{ env.PROJECT }} --configuration ${{ env.BUILD_CONFIGURATION }} --no-restore -p:Version=${{ steps.version.outputs.PACKAGE_VERSION }}
 
+      # JetStream server for the integration tests (JetStreamIntegrationTests); they are skipped when NATS_TEST_URL is unset.
+      - name: Start NATS server with JetStream
+        run: |
+          docker run -d --name nats-it -p 14333:4222 -p 18222:8222 nats:2.11.7-alpine -js -m 8222
+          curl --silent --show-error --fail --retry 15 --retry-delay 1 --retry-connrefused "http://127.0.0.1:18222/healthz?js-enabled-only=true"
+
       - name: Run tests
+        env:
+          NATS_TEST_URL: nats://127.0.0.1:14333
         run: dotnet test tests/cloops.nats.sdk.Tests/cloops.nats.sdk.Tests.csproj --configuration ${{ env.BUILD_CONFIGURATION }} --verbosity normal
 
       - name: Upload test results
@@ -73,10 +96,12 @@ jobs:
         with:
           dotnet-version: "9.0.x"
 
-      - name: Calculate package version
+      # Reuse the build job's version so build, package, tag and release always agree.
+      - name: Use package version from build
         id: version
         run: |
-          VERSION="${{ env.MAJOR }}.${{ env.MINOR }}.${{ github.run_number }}"
+          VERSION="${{ needs.build.outputs.version }}"
+          if [ -z "$VERSION" ]; then echo "Build job did not report a version" >&2; exit 1; fi
           echo "PACKAGE_VERSION=$VERSION" >> $GITHUB_OUTPUT
           echo "Package version: $VERSION"
 

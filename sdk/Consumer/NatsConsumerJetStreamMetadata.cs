@@ -41,7 +41,7 @@ public readonly record struct NatsConsumerJetStreamMetadata(
     /// </summary>
     /// <param name="msg">The JetStream message being processed.</param>
     /// <returns>The delivery information, or <c>null</c> when the message carries no metadata.</returns>
-    internal static NatsConsumerJetStreamMetadata? From(NatsJSMsg<byte[]> msg)
+    internal static NatsConsumerJetStreamMetadata? From(INatsJSMsg<byte[]> msg)
     {
         if (msg.Metadata is not { } metadata)
             return null;

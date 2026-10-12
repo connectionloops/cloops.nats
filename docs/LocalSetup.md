@@ -115,6 +115,17 @@ nats subscribe "CP.cloudpathology_deesha.EffectTriggered" \
   --deliver=all
 ```
 
+### JetStream Integration Tests
+
+`JetStreamIntegrationTests` run against a real JetStream server and are skipped unless `NATS_TEST_URL` is set. CI uses `nats:2.11.7-alpine`:
+
+```bash
+docker run -d --name nats-it -p 14333:4222 nats:2.11.7-alpine -js
+NATS_TEST_URL=nats://127.0.0.1:14333 dotnet test tests/cloops.nats.sdk.Tests/cloops.nats.sdk.Tests.csproj
+```
+
+Each test creates and deletes its own stream, so any JetStream enabled server works, including the Docker Compose one (`NATS_TEST_URL=nats://127.0.0.1:4222`). Do not point it at port 14222: other tests use that address as a server that is not running.
+
 ## 🔧 Development Workflow
 
 ### Typical Development Session
