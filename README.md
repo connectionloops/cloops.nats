@@ -91,6 +91,33 @@ The SDK resolves placeholders dynamically:
 
 > 📝 **Note**: `QueueGroupName` is optional. If omitted, an empty string is used, which still enables load balancing. JetStream subscriptions are always load-balanced (no broadcast support).
 
+### Timeouts and logging
+
+`CloopsNatsClient` runs with NATS.Net defaults unless you pass a `CloopsNatsClientOptions`. Two of those defaults bite production services:
+
+- `RequestTimeout` is **5 seconds** and also bounds the wait for a JetStream publish acknowledgement. A service that publishes to JetStream from a request path and is briefly starved (thread-pool, GC) can miss that window even though the server replied, and gets `NatsJSPublishNoResponseException`.
+- `LoggerFactory` is a `NullLoggerFactory`, so NATS.Net's own connect, reconnect, ping and retry diagnostics are discarded.
+
+Always pass a logger factory, and raise `RequestTimeout` to 15-30 seconds for services that publish to JetStream from request paths:
+
+```cs
+var cnc = new CloopsNatsClient(
+    url: "nats://dev.nats.cloops.in:4222",
+    name: "my-service",
+    creds: natsCreds,
+    options: new CloopsNatsClientOptions
+    {
+        RequestTimeout = TimeSpan.FromSeconds(30),   // JetStream publish ack wait, request/reply
+        LoggerFactory = loggerFactory,               // surfaces NATS.Net's internal diagnostics
+        // CommandTimeout, ConnectTimeout are available too; anything else via the escape hatch:
+        Configure = o => o with { MaxReconnectRetry = -1 },
+    });
+
+logger.LogInformation("NATS RequestTimeout={Timeout}", cnc.Connection.Opts.RequestTimeout);
+```
+
+Every property is optional and an unset property keeps the NATS.Net default, so existing callers using the three argument constructor are unchanged. With a `LoggerFactory` set (directly or through `Configure`) the client also logs the connection lifecycle events (`ConnectionOpened`, `ConnectionDisconnected`, `ReconnectFailed`, `MessageDropped`, `LameDuckModeActivated`) under the `CLOOPS.NATS.CloopsNatsClient` category; set `LogConnectionEvents = false` if you subscribe to them yourself. The client sets `SubPendingChannelFullMode = Wait`, so a full subscription channel applies backpressure instead of dropping messages and `MessageDropped` will rarely if ever fire under normal operation. The effective options are exposed as `cnc.Options`.
+
 ## Learn More
 
 - 📖 **[Examples](./examples)** - See real-world usage patterns

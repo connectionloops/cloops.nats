@@ -8,6 +8,7 @@ Quick navigation to key features:
 
 - [Architecture Overview](#️-architecture-overview)
 - [Available Features](#️-available-features)
+  - [Client Connection Options (Timeouts & Logging)](#-client-connection-options-timeouts--logging)
   - [Message Subscription & Consumption](#-message-subscription--consumption)
   - [JetStream Durable Consumers](#-jetstream-durable-consumers)
   - [Runtime (Dynamic) Consumer Registration](#-runtime-dynamic-consumer-registration)
@@ -37,6 +38,39 @@ The SDK provides a framework for building reliable, type-safe NATS messaging app
 **Note**: Message schemas, subject builders, and subject definitions are defined externally (typically in a separate schema package). The SDK works with any strongly-typed message types and subject strings.
 
 ## ✅ Available Features
+
+### 🔌 Client Connection Options (Timeouts & Logging)
+
+**Purpose**: Let a service tune the NATS.Net connection it runs on, and see what NATS.Net is doing, without the SDK changing behaviour for anyone who does not ask.
+
+**Key Features**:
+
+- **Backward compatible**: `new CloopsNatsClient(url, name, creds)` is unchanged. The options overload is a separate constructor, not an optional parameter, so already-compiled callers keep working
+- **Timeouts**: `RequestTimeout` (also bounds JetStream publish acknowledgement waits), `CommandTimeout`, `ConnectTimeout`. An unset property keeps the NATS.Net default (5s / 5s / 2s)
+- **Logging**: `LoggerFactory` is handed to NATS.Net so its reconnect, ping and retry diagnostics become visible (default is a `NullLoggerFactory`, which discards them). The client additionally logs `ConnectionOpened`, `ConnectionDisconnected`, `ReconnectFailed`, `MessageDropped` and `LameDuckModeActivated` with the server name under the `CLOOPS.NATS.CloopsNatsClient` category (`LogConnectionEvents = false` opts out)
+- **Escape hatch**: `Configure = o => o with { ... }` receives the fully built `NatsOpts` and runs last
+- **Inspectable**: `cnc.Options` returns the options the client was built with, `cnc.Connection.Opts` the values actually applied
+
+**Why it matters**: a JetStream publish waits at most `RequestTimeout` for the server's ack and surfaces a miss as `NatsJSPublishNoResponseException`. A service under thread-pool starvation or a GC pause can miss the default 5 second window even though the server replied. Services that publish to JetStream from request paths should run with `RequestTimeout` of 15-30 seconds, and every service should pass a `LoggerFactory`.
+
+**Quick Example**:
+
+```csharp
+var cnc = new CloopsNatsClient(
+    url: natsUrl,
+    name: "my-service",
+    creds: natsCreds,
+    options: new CloopsNatsClientOptions
+    {
+        RequestTimeout = TimeSpan.FromSeconds(30),
+        LoggerFactory = loggerFactory,
+        Configure = o => o with { MaxReconnectRetry = -1 },
+    });
+
+logger.LogInformation("NATS RequestTimeout={Timeout}", cnc.Connection.Opts.RequestTimeout);
+```
+
+**Validation**: a timeout of zero or a negative value (other than `Timeout.InfiniteTimeSpan`) throws `ArgumentOutOfRangeException` at construction.
 
 ### 📥 Message Subscription & Consumption
 
@@ -637,6 +671,7 @@ await subject.StreamPublish(new EffectTriggered { Id = "123" }, dedupeId: "uniqu
 
 - **`Client.cs`**: Main SDK client for NATS operations and connection management
 - **`CloopsNatsClient`**: Primary interface for all NATS operations
+- **`CloopsNatsClientOptions.cs`**: Optional timeouts, logger factory and `NatsOpts` escape hatch for `CloopsNatsClient`
 
 **Consumer Framework**:
 
