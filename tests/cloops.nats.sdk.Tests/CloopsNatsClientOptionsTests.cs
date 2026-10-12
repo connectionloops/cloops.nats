@@ -1,3 +1,4 @@
+using System.Reflection;
 using System.Threading.Channels;
 using CLOOPS.NATS;
 using CLOOPS.NATS.Serialization;
@@ -149,6 +150,53 @@ public class CloopsNatsClientOptionsTests
     }
 
     [Fact]
+    public void TimeoutAboveIntMaxValueMilliseconds_IsRejected()
+    {
+        var tooLong = TimeSpan.FromMilliseconds((double)int.MaxValue + 1);
+        var requestTimeout = new CloopsNatsClientOptions { RequestTimeout = tooLong };
+        var commandTimeout = new CloopsNatsClientOptions { CommandTimeout = tooLong };
+        var connectTimeout = new CloopsNatsClientOptions { ConnectTimeout = tooLong };
+
+        var ex1 = Assert.Throws<ArgumentOutOfRangeException>(() => new CloopsNatsClient(Url, Name, null, requestTimeout));
+        var ex2 = Assert.Throws<ArgumentOutOfRangeException>(() => new CloopsNatsClient(Url, Name, null, commandTimeout));
+        var ex3 = Assert.Throws<ArgumentOutOfRangeException>(() => new CloopsNatsClient(Url, Name, null, connectTimeout));
+
+        Assert.Contains(nameof(CloopsNatsClientOptions.RequestTimeout), ex1.ParamName);
+        Assert.Contains(nameof(CloopsNatsClientOptions.CommandTimeout), ex2.ParamName);
+        Assert.Contains(nameof(CloopsNatsClientOptions.ConnectTimeout), ex3.ParamName);
+    }
+
+    [Fact]
+    public async Task TimeoutOfExactlyIntMaxValueMilliseconds_AndInfinite_AreAccepted()
+    {
+        var options = new CloopsNatsClientOptions
+        {
+            RequestTimeout = TimeSpan.FromMilliseconds(int.MaxValue),
+            CommandTimeout = Timeout.InfiniteTimeSpan,
+            ConnectTimeout = Timeout.InfiniteTimeSpan,
+        };
+
+        await using var client = new CloopsNatsClient(Url, Name, creds: null, options: options);
+        var opts = client.Connection.Opts;
+
+        Assert.Equal(TimeSpan.FromMilliseconds(int.MaxValue), opts.RequestTimeout);
+        Assert.Equal(Timeout.InfiniteTimeSpan, opts.CommandTimeout);
+        Assert.Equal(Timeout.InfiniteTimeSpan, opts.ConnectTimeout);
+    }
+
+    [Fact]
+    public async Task RequestTimeout_PropagatesToTheJetStreamContext()
+    {
+        var options = new CloopsNatsClientOptions { RequestTimeout = TimeSpan.FromSeconds(30) };
+
+        await using var client = new CloopsNatsClient(Url, Name, creds: null, options: options);
+
+        // JetStream publish acks wait on the connection's RequestTimeout; the context must share it.
+        Assert.Same(client.Connection, client.JsContext.Connection);
+        Assert.Equal(TimeSpan.FromSeconds(30), client.JsContext.Connection.Opts.RequestTimeout);
+    }
+
+    [Fact]
     public async Task Creds_AreStillPassedThrough_WithOptions()
     {
         const string creds = "-----BEGIN NATS USER JWT-----\nnot.a.real.jwt\n------END NATS USER JWT------\n";
@@ -208,6 +256,57 @@ public class CloopsNatsClientOptionsTests
 
         Assert.Same(loggerFactory, client.Connection.Opts.LoggerFactory);
         Assert.Contains(typeof(CloopsNatsClient).FullName!, loggerFactory.Categories);
+    }
+
+    [Fact]
+    public async Task ConnectionEvent_IsLogged_UnderTheClientCategory()
+    {
+        using var loggerFactory = new CapturingLoggerFactory();
+        var options = new CloopsNatsClientOptions { LoggerFactory = loggerFactory };
+
+        await using var client = new CloopsNatsClient(Url, Name, creds: null, options: options);
+        await RaiseConnectionEventAsync(client, "ConnectionDisconnected", new NatsEventArgs("socket closed"));
+
+        var entry = Assert.Single(loggerFactory.Entries, e => e.Category == typeof(CloopsNatsClient).FullName);
+        Assert.Equal(LogLevel.Warning, entry.Level);
+        Assert.Contains("disconnected", entry.Message);
+        Assert.Contains("socket closed", entry.Message);
+    }
+
+    [Theory]
+    [InlineData("ConnectionOpened")]
+    [InlineData("ConnectionDisconnected")]
+    [InlineData("ReconnectFailed")]
+    public async Task ThrowingLogger_DoesNotEscapeTheConnectionEventHandler(string eventName)
+    {
+        using var loggerFactory = new ThrowingLoggerFactory();
+        var options = new CloopsNatsClientOptions { LoggerFactory = loggerFactory };
+
+        await using var client = new CloopsNatsClient(Url, Name, creds: null, options: options);
+
+        // An exception escaping here would end NATS.Net's event pump for the life of the connection.
+        var ex = await Record.ExceptionAsync(() => RaiseConnectionEventAsync(client, eventName, new NatsEventArgs("boom")));
+
+        Assert.Null(ex);
+        Assert.True(loggerFactory.LogCalls > 0);
+    }
+
+    /// <summary>
+    /// Raises a connection event the way NATS.Net's event pump does, by invoking the event's backing
+    /// delegate. Avoids needing a live server to produce a real lifecycle event.
+    /// </summary>
+    private static async Task RaiseConnectionEventAsync(CloopsNatsClient client, string eventName, NatsEventArgs args)
+    {
+        var field = typeof(NatsConnection).GetField(eventName, BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(field);
+
+        var handler = field!.GetValue(client.Connection) as Delegate;
+        Assert.NotNull(handler);
+
+        foreach (var single in handler!.GetInvocationList())
+        {
+            await (ValueTask)single.DynamicInvoke(client.Connection, args)!;
+        }
     }
 
     #endregion logger factory
@@ -280,6 +379,73 @@ public class CloopsNatsClientOptionsTests
 
         public void Dispose()
         {
+        }
+    }
+
+    /// <summary>Captures every log entry with its category, level and formatted message.</summary>
+    private sealed class CapturingLoggerFactory : ILoggerFactory
+    {
+        public List<(string Category, LogLevel Level, string Message)> Entries { get; } = new();
+
+        public ILogger CreateLogger(string categoryName) => new CapturingLogger(this, categoryName);
+
+        public void AddProvider(ILoggerProvider provider)
+        {
+        }
+
+        public void Dispose()
+        {
+        }
+
+        private sealed class CapturingLogger(CapturingLoggerFactory factory, string category) : ILogger
+        {
+            public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+            public bool IsEnabled(LogLevel logLevel) => true;
+
+            public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+            {
+                lock (factory.Entries)
+                {
+                    factory.Entries.Add((category, logLevel, formatter(state, exception)));
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Hands out loggers that throw on every <c>Log</c> call, like a broken or disposed provider. Only the
+    /// client's own category throws: NATS.Net logs through the same factory while constructing the connection,
+    /// and the test is about the client's event handlers, not NATS.Net's internals.
+    /// </summary>
+    private sealed class ThrowingLoggerFactory : ILoggerFactory
+    {
+        private int _logCalls;
+
+        public int LogCalls => Volatile.Read(ref _logCalls);
+
+        public ILogger CreateLogger(string categoryName)
+            => categoryName == typeof(CloopsNatsClient).FullName ? new ThrowingLogger(this) : NullLogger.Instance;
+
+        public void AddProvider(ILoggerProvider provider)
+        {
+        }
+
+        public void Dispose()
+        {
+        }
+
+        private sealed class ThrowingLogger(ThrowingLoggerFactory factory) : ILogger
+        {
+            public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+            public bool IsEnabled(LogLevel logLevel) => true;
+
+            public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+            {
+                Interlocked.Increment(ref factory._logCalls);
+                throw new InvalidOperationException("logger provider is broken");
+            }
         }
     }
 

@@ -116,7 +116,7 @@ var cnc = new CloopsNatsClient(
 logger.LogInformation("NATS RequestTimeout={Timeout}", cnc.Connection.Opts.RequestTimeout);
 ```
 
-Every property is optional and an unset property keeps the NATS.Net default, so existing callers using the three argument constructor are unchanged. With a `LoggerFactory` set the client also logs the connection lifecycle events (`ConnectionOpened`, `ConnectionDisconnected`, `ReconnectFailed`, `MessageDropped`, `LameDuckModeActivated`) under the `CLOOPS.NATS.CloopsNatsClient` category; set `LogConnectionEvents = false` if you subscribe to them yourself. The effective options are exposed as `cnc.Options`.
+Every property is optional and an unset property keeps the NATS.Net default, so existing callers using the three argument constructor are unchanged. With a `LoggerFactory` set (directly or through `Configure`) the client also logs the connection lifecycle events (`ConnectionOpened`, `ConnectionDisconnected`, `ReconnectFailed`, `MessageDropped`, `LameDuckModeActivated`) under the `CLOOPS.NATS.CloopsNatsClient` category; set `LogConnectionEvents = false` if you subscribe to them yourself. The client sets `SubPendingChannelFullMode = Wait`, so a full subscription channel applies backpressure instead of dropping messages and `MessageDropped` will rarely if ever fire under normal operation. The effective options are exposed as `cnc.Options`.
 
 ## Learn More
 

@@ -45,9 +45,11 @@ public sealed class CloopsNatsClientOptions
     public ILoggerFactory? LoggerFactory { get; init; }
 
     /// <summary>
-    /// When <see cref="LoggerFactory"/> is set, also log the connection lifecycle events
+    /// When a logger factory is in effect, also log the connection lifecycle events
     /// (<c>ConnectionOpened</c>, <c>ConnectionDisconnected</c>, <c>ReconnectFailed</c>, <c>MessageDropped</c>,
-    /// <c>LameDuckModeActivated</c>) under the <see cref="CloopsNatsClient"/> category. Default: <c>true</c>.
+    /// <c>LameDuckModeActivated</c>) under the <see cref="CloopsNatsClient"/> category. The final
+    /// <see cref="NatsOpts.LoggerFactory"/> is what is checked, so this applies whether the factory comes from
+    /// <see cref="LoggerFactory"/> or is supplied through <see cref="Configure"/>. Default: <c>true</c>.
     /// Set to <c>false</c> if the application subscribes to those events itself.
     /// </summary>
     public bool LogConnectionEvents { get; init; } = true;

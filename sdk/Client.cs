@@ -235,7 +235,7 @@ public class CloopsNatsClient : ICloopsNatsClient
     /// logged under the <see cref="CloopsNatsClient"/> category.
     /// </para>
     /// </remarks>
-    /// <exception cref="ArgumentOutOfRangeException">A timeout is zero or negative (other than <see cref="Timeout.InfiniteTimeSpan"/>).</exception>
+    /// <exception cref="ArgumentOutOfRangeException">A timeout is zero or negative (other than <see cref="Timeout.InfiniteTimeSpan"/>), or exceeds <see cref="int.MaxValue"/> milliseconds.</exception>
     public CloopsNatsClient(
         string url,
         string name,
@@ -305,12 +305,26 @@ public class CloopsNatsClient : ICloopsNatsClient
 
         static void ValidateTimeout(TimeSpan? value, string propertyName)
         {
-            if (value is { } timeout && timeout <= TimeSpan.Zero && timeout != Timeout.InfiniteTimeSpan)
+            if (value is not { } timeout || timeout == Timeout.InfiniteTimeSpan)
+            {
+                return;
+            }
+
+            if (timeout <= TimeSpan.Zero)
             {
                 throw new ArgumentOutOfRangeException(
                     $"{nameof(CloopsNatsClientOptions)}.{propertyName}",
                     timeout,
                     "Timeout must be greater than zero or Timeout.InfiniteTimeSpan.");
+            }
+
+            // NATS.Net hands these to CancelAfter and timers, which take at most int.MaxValue milliseconds.
+            if (timeout.TotalMilliseconds > int.MaxValue)
+            {
+                throw new ArgumentOutOfRangeException(
+                    $"{nameof(CloopsNatsClientOptions)}.{propertyName}",
+                    timeout,
+                    "Timeout must not exceed int.MaxValue milliseconds (about 24.8 days); use Timeout.InfiniteTimeSpan for no timeout.");
             }
         }
     }
