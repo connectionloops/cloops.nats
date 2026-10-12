@@ -129,6 +129,10 @@ cloops.nats 2.x depends on NATS.Net 3.3 (every `NATS.Client.*` package on the sa
 
 See the [NATS.Net 3.0 release notes](https://github.com/nats-io/nats.net/releases/tag/v3.0.0) for the full list.
 
+## Changelog
+
+Every release and change is recorded in [CHANGELOG.md](https://github.com/connectionloops/cloops.nats/blob/main/CHANGELOG.md), newest first. Every change or PR to this repository must add an entry there; see [AGENTS.md](https://github.com/connectionloops/cloops.nats/blob/main/AGENTS.md#changelog-rule) for the format.
+
 ## Learn More
 
 - 📖 **[Examples](https://github.com/connectionloops/cloops.nats/tree/main/examples)** - See real-world usage patterns
