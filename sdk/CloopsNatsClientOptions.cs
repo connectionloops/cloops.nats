@@ -57,7 +57,7 @@ public sealed class CloopsNatsClientOptions
     /// <see cref="NatsOpts"/> is an init-only record, so use a <c>with</c> expression:
     /// <c>Configure = o => o with { MaxReconnectRetry = 10 }</c>. Returning <c>null</c> keeps the options unchanged.
     /// </summary>
-    public Func<NatsOpts, NatsOpts>? Configure { get; init; }
+    public Func<NatsOpts, NatsOpts?>? Configure { get; init; }
 
     /// <summary>
     /// The options used when none are supplied: every property unset, which preserves NATS.Net defaults.

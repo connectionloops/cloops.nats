@@ -9,6 +9,7 @@ using NATS.Client.KeyValueStore;
 using CLOOPS.NATS.Locking;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CLOOPS.NATS;
 
@@ -248,9 +249,11 @@ public class CloopsNatsClient : ICloopsNatsClient
         JsContext = Connection.CreateJetStreamContext();
         KvContext = Connection.CreateKeyValueStoreContext();
 
-        if (Options.LoggerFactory is not null && Options.LogConnectionEvents)
+        // Decide from the final NatsOpts rather than the options object, so a LoggerFactory supplied through
+        // Configure gets the same lifecycle logging as one supplied through LoggerFactory.
+        if (Options.LogConnectionEvents && opts.LoggerFactory is not NullLoggerFactory)
         {
-            SubscribeConnectionEventLogging(Connection, Options.LoggerFactory.CreateLogger<CloopsNatsClient>());
+            SubscribeConnectionEventLogging(Connection, opts.LoggerFactory.CreateLogger<CloopsNatsClient>());
         }
     }
 
@@ -319,38 +322,40 @@ public class CloopsNatsClient : ICloopsNatsClient
     /// </summary>
     private static void SubscribeConnectionEventLogging(INatsConnection connection, ILogger logger)
     {
-        connection.ConnectionOpened += (_, e) =>
-        {
-            logger.LogInformation("NATS connection opened to server {NatsServer}: {Message}", ServerName(connection), e.Message);
-            return default;
-        };
+        connection.ConnectionOpened += (_, e) => Log(() =>
+            logger.LogInformation("NATS connection opened to server {NatsServer}: {Message}", ServerName(connection), e.Message));
 
-        connection.ConnectionDisconnected += (_, e) =>
-        {
-            logger.LogWarning("NATS connection disconnected from server {NatsServer}: {Message}", ServerName(connection), e.Message);
-            return default;
-        };
+        connection.ConnectionDisconnected += (_, e) => Log(() =>
+            logger.LogWarning("NATS connection disconnected from server {NatsServer}: {Message}", ServerName(connection), e.Message));
 
-        connection.ReconnectFailed += (_, e) =>
-        {
-            logger.LogWarning("NATS reconnect attempt failed (last server {NatsServer}): {Message}", ServerName(connection), e.Message);
-            return default;
-        };
+        connection.ReconnectFailed += (_, e) => Log(() =>
+            logger.LogWarning("NATS reconnect attempt failed (last server {NatsServer}): {Message}", ServerName(connection), e.Message));
 
-        connection.MessageDropped += (_, e) =>
-        {
-            logger.LogWarning("NATS message dropped on subject {Subject} with {Pending} pending messages (server {NatsServer}); the subscription's pending channel is full", e.Subject, e.Pending, ServerName(connection));
-            return default;
-        };
+        connection.MessageDropped += (_, e) => Log(() =>
+            logger.LogWarning("NATS message dropped on subject {Subject} with {Pending} pending messages (server {NatsServer}); the subscription's pending channel is full", e.Subject, e.Pending, ServerName(connection)));
 
-        connection.LameDuckModeActivated += (_, e) =>
-        {
-            logger.LogWarning("NATS server {NatsServer} at {Uri} entered lame duck mode; expect a reconnect", ServerName(connection), e.Uri);
-            return default;
-        };
+        connection.LameDuckModeActivated += (_, e) => Log(() =>
+            logger.LogWarning("NATS server {NatsServer} at {Uri} entered lame duck mode; expect a reconnect", ServerName(connection), e.Uri));
 
         static string ServerName(INatsConnection connection)
             => connection.ServerInfo?.Name is { Length: > 0 } serverName ? serverName : "(unknown)";
+
+        // NATS.Net raises every connection event from one pump; an exception escaping a handler ends that
+        // pump and every later event, including the application's own subscriptions, is lost for the life
+        // of the connection. A faulty or already-disposed logger provider must not have that blast radius.
+        static ValueTask Log(Action log)
+        {
+            try
+            {
+                log();
+            }
+            catch
+            {
+                // Logging is best effort.
+            }
+
+            return default;
+        }
     }
 
     /// <inheritdoc />

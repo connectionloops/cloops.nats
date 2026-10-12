@@ -198,6 +198,18 @@ public class CloopsNatsClientOptionsTests
         Assert.DoesNotContain(typeof(CloopsNatsClient).FullName!, loggerFactory.Categories);
     }
 
+    [Fact]
+    public async Task LoggerFactory_SetThroughConfigure_SubscribesConnectionEventLogging()
+    {
+        using var loggerFactory = new RecordingLoggerFactory();
+        var options = new CloopsNatsClientOptions { Configure = o => o with { LoggerFactory = loggerFactory } };
+
+        await using var client = new CloopsNatsClient(Url, Name, creds: null, options: options);
+
+        Assert.Same(loggerFactory, client.Connection.Opts.LoggerFactory);
+        Assert.Contains(typeof(CloopsNatsClient).FullName!, loggerFactory.Categories);
+    }
+
     #endregion logger factory
 
     #region configure hook
@@ -238,7 +250,7 @@ public class CloopsNatsClientOptionsTests
         var options = new CloopsNatsClientOptions
         {
             RequestTimeout = TimeSpan.FromSeconds(30),
-            Configure = _ => null!,
+            Configure = _ => null,
         };
 
         await using var client = new CloopsNatsClient(Url, Name, creds: null, options: options);
